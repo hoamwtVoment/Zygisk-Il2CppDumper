@@ -21,6 +21,7 @@
 #include <array>
 #include <atomic>
 #include <cerrno>
+#include <cinttypes>
 #include <cstdint>
 #include <fcntl.h>
 #include <fstream>
@@ -50,6 +51,7 @@ constexpr uint32_t kGenshin70MetadataLoaderPrologue[] = {
 using MetadataLoader = void *(*)(const char *metadata_dir);
 
 void *original_metadata_loader = nullptr;
+uintptr_t genshin_module_base = 0;
 std::string metadata_dump_dir;
 std::atomic_bool metadata_dump_started{false};
 std::atomic_bool metadata_hook_installing{false};
@@ -153,6 +155,103 @@ bool read_self_memory(uintptr_t address, void *buffer, size_t size) {
     iovec remote{reinterpret_cast<void *>(address), size};
     return process_vm_readv(getpid(), &local, 1, &remote, 1, 0) ==
            static_cast<ssize_t>(size);
+}
+
+bool dump_runtime_blob(const char *game_data_dir, const char *file_name, uintptr_t address,
+                       size_t size) {
+    std::vector<uint8_t> data(size);
+    if (!read_self_memory(address, data.data(), data.size())) {
+        write_status(game_data_dir, std::string("failed: cannot read ") + file_name +
+                                        " at " + pointer_string(reinterpret_cast<void *>(address)));
+        return false;
+    }
+
+    auto output_path = std::string(game_data_dir) + "/files/" + file_name;
+    int fd = open(output_path.c_str(), O_CREAT | O_TRUNC | O_WRONLY | O_CLOEXEC, 0600);
+    if (fd == -1) {
+        write_status(game_data_dir, "failed: cannot create " + output_path +
+                                        " errno=" + std::to_string(errno));
+        return false;
+    }
+
+    size_t written_total = 0;
+    while (written_total < data.size()) {
+        auto written = write(fd, data.data() + written_total, data.size() - written_total);
+        if (written < 0 && errno == EINTR) {
+            continue;
+        }
+        if (written <= 0) {
+            close(fd);
+            write_status(game_data_dir, "failed: cannot write " + output_path);
+            return false;
+        }
+        written_total += static_cast<size_t>(written);
+    }
+    fsync(fd);
+    close(fd);
+    write_status(game_data_dir, "runtime state captured: " + output_path + " (" +
+                                    std::to_string(size) + " bytes)");
+    return true;
+}
+
+void capture_metadata_runtime_state(const char *game_data_dir) {
+    if (!genshin_module_base || !original_metadata_loader) {
+        write_status(game_data_dir, "runtime state capture skipped: module base unavailable");
+        return;
+    }
+
+    dump_runtime_blob(game_data_dir, "metadata-runtime-state70.bin",
+                      genshin_module_base + 0x15260000, 0x1000);
+    dump_runtime_blob(game_data_dir, "metadata-runtime-keys70.bin",
+                      genshin_module_base + 0x14A4B000, 0x3000);
+
+    struct ScanRange {
+        uintptr_t begin;
+        uintptr_t end;
+    };
+    constexpr ScanRange ranges[] = {
+            {0x132301A0, 0x148C8000},
+            {0x148CB180, 0x15268EB0},
+    };
+    const auto target = reinterpret_cast<uintptr_t>(original_metadata_loader);
+    std::vector<uintptr_t> references;
+    constexpr size_t chunk_size = 1024 * 1024;
+    std::vector<uint8_t> scan_buffer(chunk_size);
+    for (const auto &range : ranges) {
+        for (auto cursor = range.begin; cursor < range.end;) {
+            auto remaining = static_cast<size_t>(range.end - cursor);
+            auto request = remaining < scan_buffer.size() ? remaining : scan_buffer.size();
+            if (read_self_memory(genshin_module_base + cursor, scan_buffer.data(), request)) {
+                for (size_t offset = 0; offset + sizeof(uintptr_t) <= request;
+                     offset += sizeof(uintptr_t)) {
+                    uintptr_t value = 0;
+                    memcpy(&value, scan_buffer.data() + offset, sizeof(value));
+                    if (value == target) {
+                        references.push_back(cursor + offset);
+                        if (references.size() == 64) {
+                            break;
+                        }
+                    }
+                }
+            }
+            if (references.size() == 64) {
+                break;
+            }
+            cursor += request;
+        }
+        if (references.size() == 64) {
+            break;
+        }
+    }
+
+    std::string message = "metadata loader pointer references=" +
+                          std::to_string(references.size());
+    for (auto rva : references) {
+        char value[32]{};
+        snprintf(value, sizeof(value), " 0x%" PRIXPTR, rva);
+        message += value;
+    }
+    write_status(game_data_dir, message);
 }
 
 bool looks_like_metadata_header(const uint8_t *header, size_t metadata_size) {
@@ -308,6 +407,7 @@ bool invoke_metadata_loader_for_dump(const char *game_data_dir) {
 
     write_status(game_data_dir, "active metadata loader returned: ptr=" +
                                     pointer_string(metadata));
+    capture_metadata_runtime_state(game_data_dir);
     if (!metadata_dump_started.exchange(true)) {
         return dump_decrypted_metadata(metadata, metadata_dir.c_str());
     }
@@ -392,6 +492,7 @@ bool install_genshin70_metadata_hook(void *handle, const char *game_data_dir) {
     }
 
     metadata_dump_dir = game_data_dir;
+    genshin_module_base = reinterpret_cast<uintptr_t>(info.dli_fbase);
     original_metadata_loader = target;
     metadata_hook_installed.store(true);
     metadata_hook_installing.store(false);
