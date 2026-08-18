@@ -28,7 +28,6 @@ public:
         preSpecialize(package_name, app_data_dir);
         env->ReleaseStringUTFChars(args->nice_name, package_name);
         env->ReleaseStringUTFChars(args->app_data_dir, app_data_dir);
-        startHackThread();
     }
 
     void postAppSpecialize(const AppSpecializeArgs *) override {

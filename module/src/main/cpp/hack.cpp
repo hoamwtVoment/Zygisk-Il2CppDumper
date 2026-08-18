@@ -16,6 +16,7 @@
 #include <thread>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/uio.h>
 #include <linux/unistd.h>
 #include <array>
 #include <atomic>
@@ -23,6 +24,7 @@
 #include <cstdint>
 #include <fcntl.h>
 #include <fstream>
+#include <vector>
 
 namespace {
 
@@ -144,6 +146,144 @@ bool dump_decrypted_metadata(const void *metadata, const char *metadata_dir) {
     return true;
 }
 
+bool read_self_memory(uintptr_t address, void *buffer, size_t size) {
+    iovec local{buffer, size};
+    iovec remote{reinterpret_cast<void *>(address), size};
+    return process_vm_readv(getpid(), &local, 1, &remote, 1, 0) ==
+           static_cast<ssize_t>(size);
+}
+
+bool looks_like_metadata_header(const uint8_t *header, size_t metadata_size) {
+    uint32_t magic = 0;
+    uint32_t version = 0;
+    memcpy(&magic, header, sizeof(magic));
+    memcpy(&version, header + 4, sizeof(version));
+    if (magic != 0xFAB11BAF || version < 20 || version > 40) {
+        return false;
+    }
+
+    int valid_ranges = 0;
+    for (size_t offset = 8; offset + 8 <= 0x80; offset += 8) {
+        uint32_t table_offset = 0;
+        uint32_t table_size = 0;
+        memcpy(&table_offset, header + offset, sizeof(table_offset));
+        memcpy(&table_size, header + offset + 4, sizeof(table_size));
+        if (table_offset >= 8 && table_offset <= metadata_size &&
+            table_size <= metadata_size - table_offset) {
+            ++valid_ranges;
+        }
+    }
+    return valid_ranges >= 8;
+}
+
+bool scan_runtime_metadata(const char *game_data_dir) {
+    metadata_dump_dir = game_data_dir;
+    auto source_path = metadata_source_path(nullptr);
+    struct stat source_stat{};
+    if (stat(source_path.c_str(), &source_stat) != 0 || source_stat.st_size <= 0) {
+        write_status(game_data_dir, "runtime scan failed: cannot stat " + source_path);
+        return false;
+    }
+    const auto metadata_size = static_cast<size_t>(source_stat.st_size);
+    write_status(game_data_dir, "runtime metadata scan starts in 3 seconds; expected size=" +
+                                    std::to_string(metadata_size));
+    sleep(3);
+
+    FILE *maps = fopen("/proc/self/maps", "r");
+    if (!maps) {
+        write_status(game_data_dir, "runtime scan failed: cannot open /proc/self/maps");
+        return false;
+    }
+
+    constexpr size_t scan_chunk_size = 4 * 1024 * 1024;
+    constexpr size_t maximum_mapping_size = 768ULL * 1024 * 1024;
+    std::vector<uint8_t> buffer(scan_chunk_size + 0x100);
+    char line[2048]{};
+    size_t scanned = 0;
+    size_t next_progress = 256ULL * 1024 * 1024;
+    int candidate_mappings = 0;
+
+    while (fgets(line, sizeof(line), maps)) {
+        unsigned long long map_start_value = 0;
+        unsigned long long map_end_value = 0;
+        char permissions[5]{};
+        char pathname[1024]{};
+        int fields = sscanf(line, "%llx-%llx %4s %*s %*s %*s %1023[^\n]",
+                            &map_start_value, &map_end_value, permissions, pathname);
+        if (fields < 3 || permissions[0] != 'r') {
+            continue;
+        }
+        auto map_start = static_cast<uintptr_t>(map_start_value);
+        auto map_end = static_cast<uintptr_t>(map_end_value);
+        if (map_end <= map_start) {
+            continue;
+        }
+        auto map_size = static_cast<size_t>(map_end - map_start);
+        if (map_size < metadata_size || map_size > maximum_mapping_size) {
+            continue;
+        }
+        if (fields >= 4) {
+            const char *path = pathname;
+            while (*path == ' ') {
+                ++path;
+            }
+            if (*path == '/') {
+                continue;
+            }
+        }
+
+        ++candidate_mappings;
+        size_t map_offset = 0;
+        while (map_offset < map_size) {
+            auto remaining = map_size - map_offset;
+            auto request = remaining < scan_chunk_size ? remaining : scan_chunk_size;
+            if (!read_self_memory(map_start + map_offset, buffer.data(), request)) {
+                map_offset += request;
+                scanned += request;
+                continue;
+            }
+
+            for (size_t index = 0; index + 0x100 <= request; ++index) {
+                if (buffer[index] != 0xAF || buffer[index + 1] != 0x1B ||
+                    buffer[index + 2] != 0xB1 || buffer[index + 3] != 0xFA) {
+                    continue;
+                }
+                auto address = map_start + map_offset + index;
+                if (metadata_size > map_end - address ||
+                    !looks_like_metadata_header(buffer.data() + index, metadata_size)) {
+                    continue;
+                }
+
+                fclose(maps);
+                write_status(game_data_dir, "runtime metadata located at " +
+                                                pointer_string(reinterpret_cast<void *>(address)) +
+                                                " after scanning " + std::to_string(scanned) +
+                                                " bytes");
+                if (!metadata_dump_started.exchange(true)) {
+                    return dump_decrypted_metadata(reinterpret_cast<void *>(address), nullptr);
+                }
+                return true;
+            }
+
+            auto advance = remaining > request ? request - 0x100 : request;
+            map_offset += advance;
+            scanned += advance;
+            if (scanned >= next_progress) {
+                write_status(game_data_dir, "runtime metadata scan progress: " +
+                                                std::to_string(scanned / (1024 * 1024)) +
+                                                " MiB");
+                next_progress += 256ULL * 1024 * 1024;
+            }
+        }
+    }
+
+    fclose(maps);
+    write_status(game_data_dir, "runtime metadata scan complete: no standard header found; mappings=" +
+                                    std::to_string(candidate_mappings) + " scanned=" +
+                                    std::to_string(scanned) + " bytes");
+    return false;
+}
+
 void *hooked_metadata_loader(const char *metadata_dir) {
     write_status(metadata_dump_dir.c_str(), "metadata decrypt hook entered: dir=" +
                                                std::string(metadata_dir ? metadata_dir : "<null>"));
@@ -249,6 +389,7 @@ void hack_start(const char *game_data_dir) {
 #if defined(__aarch64__)
             if (strcmp(library_name, "libyuanshen.so") == 0) {
                 install_genshin70_metadata_hook(handle, game_data_dir);
+                scan_runtime_metadata(game_data_dir);
                 return;
             }
 #endif
