@@ -17,6 +17,10 @@
 #include <sys/stat.h>
 #include <linux/unistd.h>
 #include <array>
+#include <atomic>
+#include <cerrno>
+#include <cstdint>
+#include <fcntl.h>
 #include <fstream>
 
 namespace {
@@ -33,12 +37,203 @@ void write_status(const char *game_data_dir, const std::string &message, bool re
     LOGI("%s", message.c_str());
 }
 
+#if defined(__aarch64__)
+
+constexpr uintptr_t kGenshin70MetadataLoaderRva = 0x074B8FAC;
+constexpr uint32_t kGenshin70MetadataLoaderPrologue[] = {
+        0xA9BA7BFD, 0xA9016FFC, 0xA90267FA, 0xA9035FF8,
+};
+
+using MetadataLoader = void *(*)(const char *metadata_dir);
+
+void *original_metadata_loader = nullptr;
+std::string metadata_dump_dir;
+std::atomic_bool metadata_dump_started{false};
+
+std::string pointer_string(const void *value) {
+    char buffer[32]{};
+    snprintf(buffer, sizeof(buffer), "%p", value);
+    return buffer;
+}
+
+std::string metadata_source_path(const char *metadata_dir) {
+    if (metadata_dir && metadata_dir[0] != '\0') {
+        std::string path(metadata_dir);
+        if (path.back() != '/') {
+            path.push_back('/');
+        }
+        path += "global-metadata.dat";
+        struct stat source_stat{};
+        if (stat(path.c_str(), &source_stat) == 0 && source_stat.st_size > 0) {
+            return path;
+        }
+    }
+
+    return std::string("/storage/emulated/0/Android/data/") + GamePackageName +
+           "/files/il2cpp/Metadata/global-metadata.dat";
+}
+
+bool dump_decrypted_metadata(const void *metadata, const char *metadata_dir) {
+    if (!metadata) {
+        write_status(metadata_dump_dir.c_str(), "failed: metadata loader returned null");
+        return false;
+    }
+
+    auto source_path = metadata_source_path(metadata_dir);
+    struct stat source_stat{};
+    if (stat(source_path.c_str(), &source_stat) != 0 || source_stat.st_size <= 0 ||
+        source_stat.st_size > 512LL * 1024 * 1024) {
+        write_status(metadata_dump_dir.c_str(), "failed: cannot determine metadata size from " +
+                                                   source_path);
+        return false;
+    }
+
+    const auto metadata_size = static_cast<size_t>(source_stat.st_size);
+    const auto *bytes = static_cast<const uint8_t *>(metadata);
+    char magic[32]{};
+    snprintf(magic, sizeof(magic), "%02X %02X %02X %02X", bytes[0], bytes[1], bytes[2],
+             bytes[3]);
+    write_status(metadata_dump_dir.c_str(), "metadata decrypted: ptr=" + pointer_string(metadata) +
+                                               " size=" + std::to_string(metadata_size) +
+                                               " magic=" + magic);
+
+    auto output_path = metadata_dump_dir + "/files/global-metadata-decrypted70.dat";
+    int fd = open(output_path.c_str(), O_CREAT | O_TRUNC | O_WRONLY | O_CLOEXEC, 0600);
+    if (fd == -1) {
+        write_status(metadata_dump_dir.c_str(), "failed: cannot create " + output_path +
+                                                   " errno=" + std::to_string(errno));
+        return false;
+    }
+
+    constexpr size_t chunk_size = 1024 * 1024;
+    constexpr size_t progress_step = 8 * 1024 * 1024;
+    size_t offset = 0;
+    size_t next_progress = progress_step;
+    while (offset < metadata_size) {
+        auto remaining = metadata_size - offset;
+        auto requested = remaining < chunk_size ? remaining : chunk_size;
+        auto written = write(fd, bytes + offset, requested);
+        if (written < 0 && errno == EINTR) {
+            continue;
+        }
+        if (written <= 0) {
+            auto saved_errno = errno;
+            close(fd);
+            write_status(metadata_dump_dir.c_str(), "failed: metadata write stopped at " +
+                                                       std::to_string(offset) + " bytes errno=" +
+                                                       std::to_string(saved_errno));
+            return false;
+        }
+        offset += static_cast<size_t>(written);
+        if (offset >= next_progress && offset < metadata_size) {
+            write_status(metadata_dump_dir.c_str(), "dumping decrypted metadata: " +
+                                                       std::to_string(offset / (1024 * 1024)) +
+                                                       "/" +
+                                                       std::to_string(metadata_size / (1024 * 1024)) +
+                                                       " MiB");
+            next_progress += progress_step;
+        }
+    }
+
+    fsync(fd);
+    close(fd);
+    write_status(metadata_dump_dir.c_str(), "complete: " + output_path + " (" +
+                                               std::to_string(metadata_size) + " bytes, magic=" +
+                                               magic + ")");
+    return true;
+}
+
+void *hooked_metadata_loader(const char *metadata_dir) {
+    write_status(metadata_dump_dir.c_str(), "metadata decrypt hook entered: dir=" +
+                                               std::string(metadata_dir ? metadata_dir : "<null>"));
+    auto *metadata = reinterpret_cast<MetadataLoader>(original_metadata_loader)(metadata_dir);
+    if (!metadata_dump_started.exchange(true)) {
+        dump_decrypted_metadata(metadata, metadata_dir);
+    }
+    return metadata;
+}
+
+bool install_inline_hook(void *target, void *replacement, void **original) {
+    constexpr size_t overwritten_size = sizeof(kGenshin70MetadataLoaderPrologue);
+    constexpr size_t trampoline_size = overwritten_size + 16;
+    auto *trampoline = static_cast<uint8_t *>(mmap(nullptr, trampoline_size,
+                                                    PROT_READ | PROT_WRITE,
+                                                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    if (trampoline == MAP_FAILED) {
+        return false;
+    }
+
+    memcpy(trampoline, target, overwritten_size);
+    const uint32_t absolute_jump[] = {0x58000051, 0xD61F0220}; // ldr x17, #8; br x17
+    memcpy(trampoline + overwritten_size, absolute_jump, sizeof(absolute_jump));
+    auto resume = reinterpret_cast<uintptr_t>(target) + overwritten_size;
+    memcpy(trampoline + overwritten_size + sizeof(absolute_jump), &resume, sizeof(resume));
+    __builtin___clear_cache(reinterpret_cast<char *>(trampoline),
+                            reinterpret_cast<char *>(trampoline + trampoline_size));
+    if (mprotect(trampoline, trampoline_size, PROT_READ | PROT_EXEC) != 0) {
+        munmap(trampoline, trampoline_size);
+        return false;
+    }
+    *original = trampoline;
+
+    auto page_size = static_cast<uintptr_t>(sysconf(_SC_PAGESIZE));
+    auto page = reinterpret_cast<uintptr_t>(target) & ~(page_size - 1);
+    if (mprotect(reinterpret_cast<void *>(page), page_size,
+                 PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+        munmap(trampoline, trampoline_size);
+        return false;
+    }
+
+    uint8_t patch[16]{};
+    memcpy(patch, absolute_jump, sizeof(absolute_jump));
+    auto replacement_address = reinterpret_cast<uintptr_t>(replacement);
+    memcpy(patch + sizeof(absolute_jump), &replacement_address, sizeof(replacement_address));
+    memcpy(target, patch, sizeof(patch));
+    __builtin___clear_cache(reinterpret_cast<char *>(target),
+                            reinterpret_cast<char *>(target) + sizeof(patch));
+    mprotect(reinterpret_cast<void *>(page), page_size, PROT_READ | PROT_EXEC);
+    return true;
+}
+
+bool install_genshin70_metadata_hook(void *handle, const char *game_data_dir) {
+    xdl_info_t info{};
+    if (xdl_info(handle, XDL_DI_DLINFO, &info) != 0 || !info.dli_fbase) {
+        write_status(game_data_dir, "failed: cannot resolve libyuanshen.so load base");
+        return false;
+    }
+
+    auto *target = static_cast<uint8_t *>(info.dli_fbase) + kGenshin70MetadataLoaderRva;
+    if (memcmp(target, kGenshin70MetadataLoaderPrologue,
+               sizeof(kGenshin70MetadataLoaderPrologue)) != 0) {
+        write_status(game_data_dir, "failed: 7.0 metadata loader prologue mismatch at " +
+                                        pointer_string(target));
+        return false;
+    }
+
+    metadata_dump_dir = game_data_dir;
+    if (!install_inline_hook(target, reinterpret_cast<void *>(hooked_metadata_loader),
+                             &original_metadata_loader)) {
+        write_status(game_data_dir, "failed: cannot install 7.0 metadata decrypt hook errno=" +
+                                        std::to_string(errno));
+        return false;
+    }
+    write_status(game_data_dir, "7.0 metadata decrypt hook installed: base=" +
+                                    pointer_string(info.dli_fbase) + " target=" +
+                                    pointer_string(target) + " RVA=0x74B8FAC");
+    return true;
+}
+
+#endif
+
 }
 
 void hack_start(const char *game_data_dir) {
     constexpr const char *library_candidates[] = {"libil2cpp.so", "libyuanshen.so"};
     write_status(game_data_dir, "module injected; waiting for IL2CPP runtime library", true);
-    for (int i = 0; i < 1800; i++) {
+    constexpr int timeout_ms = 1800 * 1000;
+    int elapsed_ms = 0;
+    int next_status_ms = 30 * 1000;
+    while (elapsed_ms < timeout_ms) {
         void *handle = nullptr;
         const char *library_name = nullptr;
         for (const auto candidate : library_candidates) {
@@ -49,8 +244,14 @@ void hack_start(const char *game_data_dir) {
             }
         }
         if (handle) {
-            write_status(game_data_dir, std::string(library_name) +
-                                        " found; resolving IL2CPP APIs");
+            write_status(game_data_dir, std::string(library_name) + " found");
+#if defined(__aarch64__)
+            if (strcmp(library_name, "libyuanshen.so") == 0) {
+                install_genshin70_metadata_hook(handle, game_data_dir);
+                return;
+            }
+#endif
+            write_status(game_data_dir, "resolving IL2CPP APIs");
             if (!il2cpp_api_init(handle)) {
                 write_status(game_data_dir, "failed: required IL2CPP APIs are not exported");
                 return;
@@ -67,11 +268,14 @@ void hack_start(const char *game_data_dir) {
             }
             return;
         }
-        if (i > 0 && i % 30 == 0) {
+        int delay_ms = elapsed_ms < 60 * 1000 ? 10 : 1000;
+        usleep(delay_ms * 1000);
+        elapsed_ms += delay_ms;
+        if (elapsed_ms >= next_status_ms) {
             write_status(game_data_dir, "still waiting for IL2CPP runtime library (" +
-                                        std::to_string(i) + " seconds)");
+                                        std::to_string(elapsed_ms / 1000) + " seconds)");
+            next_status_ms += 30 * 1000;
         }
-        sleep(1);
     }
     write_status(game_data_dir, "failed: IL2CPP runtime library not loaded after 1800 seconds");
 }
