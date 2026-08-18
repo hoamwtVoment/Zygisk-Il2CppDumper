@@ -15,53 +15,6 @@ using zygisk::Api;
 using zygisk::AppSpecializeArgs;
 using zygisk::ServerSpecializeArgs;
 
-namespace {
-
-using DlopenFunction = void *(*)(const char *filename, int flags);
-using AndroidDlopenExtFunction = void *(*)(const char *filename, int flags,
-                                            const void *extension_info);
-
-DlopenFunction original_dlopen = nullptr;
-AndroidDlopenExtFunction original_android_dlopen_ext = nullptr;
-const char *early_game_data_dir = nullptr;
-thread_local bool inside_load_hook = false;
-
-void notify_library_loaded(const char *filename, void *handle) {
-    if (handle && filename && early_game_data_dir && strstr(filename, "libyuanshen.so")) {
-        hack_on_library_loaded(filename, early_game_data_dir);
-    }
-}
-
-void *hooked_dlopen(const char *filename, int flags) {
-    if (!original_dlopen) {
-        return nullptr;
-    }
-    if (inside_load_hook) {
-        return original_dlopen(filename, flags);
-    }
-    inside_load_hook = true;
-    auto *handle = original_dlopen(filename, flags);
-    notify_library_loaded(filename, handle);
-    inside_load_hook = false;
-    return handle;
-}
-
-void *hooked_android_dlopen_ext(const char *filename, int flags, const void *extension_info) {
-    if (!original_android_dlopen_ext) {
-        return nullptr;
-    }
-    if (inside_load_hook) {
-        return original_android_dlopen_ext(filename, flags, extension_info);
-    }
-    inside_load_hook = true;
-    auto *handle = original_android_dlopen_ext(filename, flags, extension_info);
-    notify_library_loaded(filename, handle);
-    inside_load_hook = false;
-    return handle;
-}
-
-}
-
 class MyModule : public zygisk::ModuleBase {
 public:
     void onLoad(Api *api, JNIEnv *env) override {
@@ -73,7 +26,6 @@ public:
         auto package_name = env->GetStringUTFChars(args->nice_name, nullptr);
         auto app_data_dir = env->GetStringUTFChars(args->app_data_dir, nullptr);
         preSpecialize(package_name, app_data_dir);
-        installEarlyLibraryHooks();
         env->ReleaseStringUTFChars(args->nice_name, package_name);
         env->ReleaseStringUTFChars(args->app_data_dir, app_data_dir);
     }
@@ -90,21 +42,6 @@ private:
     void *data = nullptr;
     size_t length = 0;
     bool hack_started = false;
-
-    void installEarlyLibraryHooks() {
-#if defined(__aarch64__)
-        if (!enable_hack) {
-            return;
-        }
-        early_game_data_dir = game_data_dir;
-        api->pltHookRegister(".*", "dlopen", reinterpret_cast<void *>(hooked_dlopen),
-                             reinterpret_cast<void **>(&original_dlopen));
-        api->pltHookRegister(".*", "android_dlopen_ext",
-                             reinterpret_cast<void *>(hooked_android_dlopen_ext),
-                             reinterpret_cast<void **>(&original_android_dlopen_ext));
-        LOGI("early library hooks committed: %s", api->pltHookCommit() ? "yes" : "no");
-#endif
-    }
 
     void startHackThread() {
         if (enable_hack && !hack_started) {

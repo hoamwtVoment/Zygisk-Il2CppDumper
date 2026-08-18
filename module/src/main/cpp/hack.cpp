@@ -290,6 +290,30 @@ bool scan_runtime_metadata(const char *game_data_dir) {
     return false;
 }
 
+bool invoke_metadata_loader_for_dump(const char *game_data_dir) {
+    if (!original_metadata_loader) {
+        write_status(game_data_dir, "active metadata decrypt failed: original loader unavailable");
+        return false;
+    }
+
+    auto metadata_dir = std::string("/storage/emulated/0/Android/data/") + GamePackageName +
+                        "/files/il2cpp/Metadata/";
+    write_status(game_data_dir, "actively invoking 7.0 metadata loader: dir=" + metadata_dir);
+    auto loader = reinterpret_cast<MetadataLoader>(original_metadata_loader);
+    auto *metadata = loader(metadata_dir.c_str());
+    if (!metadata) {
+        write_status(game_data_dir, "active metadata decrypt failed: loader returned null");
+        return false;
+    }
+
+    write_status(game_data_dir, "active metadata loader returned: ptr=" +
+                                    pointer_string(metadata));
+    if (!metadata_dump_started.exchange(true)) {
+        return dump_decrypted_metadata(metadata, metadata_dir.c_str());
+    }
+    return true;
+}
+
 void *hooked_metadata_loader(const char *metadata_dir) {
     write_status(metadata_dump_dir.c_str(), "metadata decrypt hook entered: dir=" +
                                                std::string(metadata_dir ? metadata_dir : "<null>"));
@@ -368,16 +392,10 @@ bool install_genshin70_metadata_hook(void *handle, const char *game_data_dir) {
     }
 
     metadata_dump_dir = game_data_dir;
-    if (!install_inline_hook(target, reinterpret_cast<void *>(hooked_metadata_loader),
-                             &original_metadata_loader)) {
-        write_status(game_data_dir, "failed: cannot install 7.0 metadata decrypt hook errno=" +
-                                        std::to_string(errno));
-        metadata_hook_installing.store(false);
-        return false;
-    }
+    original_metadata_loader = target;
     metadata_hook_installed.store(true);
     metadata_hook_installing.store(false);
-    write_status(game_data_dir, "7.0 metadata decrypt hook installed: base=" +
+    write_status(game_data_dir, "7.0 metadata loader resolved without patching: base=" +
                                     pointer_string(info.dli_fbase) + " target=" +
                                     pointer_string(target) + " RVA=0x74B8FAC");
     return true;
@@ -385,23 +403,6 @@ bool install_genshin70_metadata_hook(void *handle, const char *game_data_dir) {
 
 #endif
 
-}
-
-void hack_on_library_loaded(const char *library_path, const char *game_data_dir) {
-#if defined(__aarch64__)
-    if (!library_path || !strstr(library_path, "libyuanshen.so")) {
-        return;
-    }
-    metadata_dump_dir = game_data_dir;
-    auto *handle = xdl_open("libyuanshen.so", 0);
-    if (handle) {
-        install_genshin70_metadata_hook(handle, game_data_dir);
-        xdl_close(handle);
-    }
-#else
-    (void) library_path;
-    (void) game_data_dir;
-#endif
 }
 
 void hack_start(const char *game_data_dir) {
@@ -424,8 +425,19 @@ void hack_start(const char *game_data_dir) {
             write_status(game_data_dir, std::string(library_name) + " found");
 #if defined(__aarch64__)
             if (strcmp(library_name, "libyuanshen.so") == 0) {
-                install_genshin70_metadata_hook(handle, game_data_dir);
-                scan_runtime_metadata(game_data_dir);
+                if (!install_genshin70_metadata_hook(handle, game_data_dir)) {
+                    write_status(game_data_dir,
+                                 "failed: 7.0 metadata loader could not be resolved; stopping");
+                    return;
+                }
+                write_status(game_data_dir,
+                             "waiting 3 seconds before active metadata loader invocation");
+                sleep(3);
+                if (!invoke_metadata_loader_for_dump(game_data_dir)) {
+                    write_status(game_data_dir,
+                                 "failed: active metadata extraction did not produce an output; "
+                                 "runtime memory scan disabled");
+                }
                 return;
             }
 #endif
