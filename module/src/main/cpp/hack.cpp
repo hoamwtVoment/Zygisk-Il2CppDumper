@@ -36,11 +36,21 @@ void write_status(const char *game_data_dir, const std::string &message, bool re
 }
 
 void hack_start(const char *game_data_dir) {
-    write_status(game_data_dir, "module injected; waiting for libil2cpp.so", true);
+    constexpr const char *library_candidates[] = {"libil2cpp.so", "libyuanshen.so"};
+    write_status(game_data_dir, "module injected; waiting for IL2CPP runtime library", true);
     for (int i = 0; i < 1800; i++) {
-        void *handle = xdl_open("libil2cpp.so", 0);
+        void *handle = nullptr;
+        const char *library_name = nullptr;
+        for (const auto candidate : library_candidates) {
+            handle = xdl_open(candidate, 0);
+            if (handle) {
+                library_name = candidate;
+                break;
+            }
+        }
         if (handle) {
-            write_status(game_data_dir, "libil2cpp.so found; resolving IL2CPP APIs");
+            write_status(game_data_dir, std::string(library_name) +
+                                        " found; resolving IL2CPP APIs");
             if (!il2cpp_api_init(handle)) {
                 write_status(game_data_dir, "failed: required IL2CPP APIs are not exported");
                 return;
@@ -58,12 +68,12 @@ void hack_start(const char *game_data_dir) {
             return;
         }
         if (i > 0 && i % 30 == 0) {
-            write_status(game_data_dir, "still waiting for libil2cpp.so (" +
+            write_status(game_data_dir, "still waiting for IL2CPP runtime library (" +
                                         std::to_string(i) + " seconds)");
         }
         sleep(1);
     }
-    write_status(game_data_dir, "failed: libil2cpp.so not loaded after 1800 seconds");
+    write_status(game_data_dir, "failed: IL2CPP runtime library not loaded after 1800 seconds");
 }
 
 std::string GetLibDir(JavaVM *vms) {
