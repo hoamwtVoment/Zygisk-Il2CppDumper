@@ -49,6 +49,7 @@ constexpr uint32_t kGenshin70MetadataLoaderPrologue[] = {
 };
 
 using MetadataLoader = void *(*)(const char *metadata_dir);
+using MetadataBufferDecoder = int (*)(void *buffer, uint32_t length);
 
 void *original_metadata_loader = nullptr;
 uintptr_t genshin_module_base = 0;
@@ -254,6 +255,26 @@ void capture_metadata_runtime_state(const char *game_data_dir) {
     write_status(game_data_dir, message);
 }
 
+void probe_metadata_buffer_decoder(const char *game_data_dir, const void *metadata) {
+    constexpr uintptr_t decoder_rva = 0x074B8990;
+    constexpr size_t probe_size = 0x1000;
+    std::vector<uint8_t> probe(probe_size);
+    if (!read_self_memory(reinterpret_cast<uintptr_t>(metadata), probe.data(), probe.size())) {
+        write_status(game_data_dir, "metadata decoder probe failed: cannot copy source header");
+        return;
+    }
+
+    auto decoder = reinterpret_cast<MetadataBufferDecoder>(genshin_module_base + decoder_rva);
+    auto result = decoder(probe.data(), static_cast<uint32_t>(probe.size()));
+    char magic[32]{};
+    snprintf(magic, sizeof(magic), "%02X %02X %02X %02X", probe[0], probe[1], probe[2],
+             probe[3]);
+    write_status(game_data_dir, "metadata decoder RVA 0x74B8990 result=" +
+                                    std::to_string(result) + " magic=" + magic);
+    dump_runtime_blob(game_data_dir, "metadata-header-probe70.bin",
+                      reinterpret_cast<uintptr_t>(probe.data()), probe.size());
+}
+
 bool looks_like_metadata_header(const uint8_t *header, size_t metadata_size) {
     uint32_t magic = 0;
     uint32_t version = 0;
@@ -408,6 +429,7 @@ bool invoke_metadata_loader_for_dump(const char *game_data_dir) {
     write_status(game_data_dir, "active metadata loader returned: ptr=" +
                                     pointer_string(metadata));
     capture_metadata_runtime_state(game_data_dir);
+    probe_metadata_buffer_decoder(game_data_dir, metadata);
     if (!metadata_dump_started.exchange(true)) {
         return dump_decrypted_metadata(metadata, metadata_dir.c_str());
     }
