@@ -28,22 +28,29 @@ public:
         preSpecialize(package_name, app_data_dir);
         env->ReleaseStringUTFChars(args->nice_name, package_name);
         env->ReleaseStringUTFChars(args->app_data_dir, app_data_dir);
+        startHackThread();
     }
 
     void postAppSpecialize(const AppSpecializeArgs *) override {
-        if (enable_hack) {
-            std::thread hack_thread(hack_prepare, game_data_dir, data, length);
-            hack_thread.detach();
-        }
+        startHackThread();
     }
 
 private:
     Api *api;
     JNIEnv *env;
-    bool enable_hack;
-    char *game_data_dir;
-    void *data;
-    size_t length;
+    bool enable_hack = false;
+    char *game_data_dir = nullptr;
+    void *data = nullptr;
+    size_t length = 0;
+    bool hack_started = false;
+
+    void startHackThread() {
+        if (enable_hack && !hack_started) {
+            hack_started = true;
+            std::thread hack_thread(hack_prepare, game_data_dir, data, length);
+            hack_thread.detach();
+        }
+    }
 
     void preSpecialize(const char *package_name, const char *app_data_dir) {
         if (strcmp(package_name, GamePackageName) == 0) {
