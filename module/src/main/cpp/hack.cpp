@@ -16,23 +16,53 @@
 #include <sys/mman.h>
 #include <linux/unistd.h>
 #include <array>
+#include <fstream>
+
+namespace {
+
+std::string status_path(const char *game_data_dir) {
+    return std::string(game_data_dir) + "/files/il2cppdumper_status.log";
+}
+
+void write_status(const char *game_data_dir, const std::string &message, bool reset = false) {
+    std::ofstream stream(status_path(game_data_dir), reset ? std::ios::trunc : std::ios::app);
+    if (stream) {
+        stream << message << '\n';
+    }
+    LOGI("%s", message.c_str());
+}
+
+}
 
 void hack_start(const char *game_data_dir) {
-    bool load = false;
-    for (int i = 0; i < 10; i++) {
+    write_status(game_data_dir, "module injected; waiting for libil2cpp.so", true);
+    for (int i = 0; i < 1800; i++) {
         void *handle = xdl_open("libil2cpp.so", 0);
         if (handle) {
-            load = true;
-            il2cpp_api_init(handle);
+            write_status(game_data_dir, "libil2cpp.so found; resolving IL2CPP APIs");
+            if (!il2cpp_api_init(handle)) {
+                write_status(game_data_dir, "failed: required IL2CPP APIs are not exported");
+                return;
+            }
+            write_status(game_data_dir, "IL2CPP initialized; dumping classes");
             il2cpp_dump(game_data_dir);
-            break;
-        } else {
-            sleep(1);
+            struct stat dump_stat{};
+            auto dump_path = std::string(game_data_dir) + "/files/dump.cs";
+            if (stat(dump_path.c_str(), &dump_stat) == 0 && dump_stat.st_size > 0) {
+                write_status(game_data_dir, "complete: dump.cs written (" +
+                                            std::to_string(dump_stat.st_size) + " bytes)");
+            } else {
+                write_status(game_data_dir, "failed: dump.cs was not created");
+            }
+            return;
         }
+        if (i > 0 && i % 30 == 0) {
+            write_status(game_data_dir, "still waiting for libil2cpp.so (" +
+                                        std::to_string(i) + " seconds)");
+        }
+        sleep(1);
     }
-    if (!load) {
-        LOGI("libil2cpp.so not found in thread %d", gettid());
-    }
+    write_status(game_data_dir, "failed: libil2cpp.so not loaded after 1800 seconds");
 }
 
 std::string GetLibDir(JavaVM *vms) {

@@ -322,10 +322,11 @@ std::string dump_type(const Il2CppType *type) {
     return outPut.str();
 }
 
-void il2cpp_api_init(void *handle) {
+bool il2cpp_api_init(void *handle) {
     LOGI("il2cpp_handle: %p", handle);
     init_il2cpp_api(handle);
-    if (il2cpp_domain_get_assemblies) {
+    if (il2cpp_domain_get_assemblies && il2cpp_is_vm_thread && il2cpp_domain_get &&
+        il2cpp_thread_attach) {
         Dl_info dlInfo;
         if (dladdr((void *) il2cpp_domain_get_assemblies, &dlInfo)) {
             il2cpp_base = reinterpret_cast<uint64_t>(dlInfo.dli_fbase);
@@ -333,7 +334,7 @@ void il2cpp_api_init(void *handle) {
         LOGI("il2cpp_base: %" PRIx64"", il2cpp_base);
     } else {
         LOGE("Failed to initialize il2cpp api.");
-        return;
+        return false;
     }
     while (!il2cpp_is_vm_thread(nullptr)) {
         LOGI("Waiting for il2cpp_init...");
@@ -341,6 +342,7 @@ void il2cpp_api_init(void *handle) {
     }
     auto domain = il2cpp_domain_get();
     il2cpp_thread_attach(domain);
+    return true;
 }
 
 void il2cpp_dump(const char *outDir) {
