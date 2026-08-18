@@ -190,6 +190,10 @@ bool scan_runtime_metadata(const char *game_data_dir) {
     write_status(game_data_dir, "runtime metadata scan starts in 3 seconds; expected size=" +
                                     std::to_string(metadata_size));
     sleep(3);
+    if (metadata_dump_started.load()) {
+        write_status(game_data_dir, "runtime metadata scan skipped: decrypt hook already captured buffer");
+        return true;
+    }
 
     FILE *maps = fopen("/proc/self/maps", "r");
     if (!maps) {
