@@ -14,6 +14,7 @@
 #include <jni.h>
 #include <thread>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <linux/unistd.h>
 #include <array>
 #include <fstream>
