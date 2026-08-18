@@ -3,6 +3,7 @@
 //
 
 #include "hack.h"
+#include "game.h"
 #include "il2cpp_dump.h"
 #include "log.h"
 #include "xdl.h"
