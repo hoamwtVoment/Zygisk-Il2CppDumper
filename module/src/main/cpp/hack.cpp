@@ -52,6 +52,8 @@ using MetadataLoader = void *(*)(const char *metadata_dir);
 void *original_metadata_loader = nullptr;
 std::string metadata_dump_dir;
 std::atomic_bool metadata_dump_started{false};
+std::atomic_bool metadata_hook_installing{false};
+std::atomic_bool metadata_hook_installed{false};
 
 std::string pointer_string(const void *value) {
     char buffer[32]{};
@@ -337,9 +339,18 @@ bool install_inline_hook(void *target, void *replacement, void **original) {
 }
 
 bool install_genshin70_metadata_hook(void *handle, const char *game_data_dir) {
+    if (metadata_hook_installed.load()) {
+        return true;
+    }
+    bool expected = false;
+    if (!metadata_hook_installing.compare_exchange_strong(expected, true)) {
+        return metadata_hook_installed.load();
+    }
+
     xdl_info_t info{};
     if (xdl_info(handle, XDL_DI_DLINFO, &info) != 0 || !info.dli_fbase) {
         write_status(game_data_dir, "failed: cannot resolve libyuanshen.so load base");
+        metadata_hook_installing.store(false);
         return false;
     }
 
@@ -348,6 +359,7 @@ bool install_genshin70_metadata_hook(void *handle, const char *game_data_dir) {
                sizeof(kGenshin70MetadataLoaderPrologue)) != 0) {
         write_status(game_data_dir, "failed: 7.0 metadata loader prologue mismatch at " +
                                         pointer_string(target));
+        metadata_hook_installing.store(false);
         return false;
     }
 
@@ -356,8 +368,11 @@ bool install_genshin70_metadata_hook(void *handle, const char *game_data_dir) {
                              &original_metadata_loader)) {
         write_status(game_data_dir, "failed: cannot install 7.0 metadata decrypt hook errno=" +
                                         std::to_string(errno));
+        metadata_hook_installing.store(false);
         return false;
     }
+    metadata_hook_installed.store(true);
+    metadata_hook_installing.store(false);
     write_status(game_data_dir, "7.0 metadata decrypt hook installed: base=" +
                                     pointer_string(info.dli_fbase) + " target=" +
                                     pointer_string(target) + " RVA=0x74B8FAC");
@@ -366,6 +381,23 @@ bool install_genshin70_metadata_hook(void *handle, const char *game_data_dir) {
 
 #endif
 
+}
+
+void hack_on_library_loaded(const char *library_path, const char *game_data_dir) {
+#if defined(__aarch64__)
+    if (!library_path || !strstr(library_path, "libyuanshen.so")) {
+        return;
+    }
+    metadata_dump_dir = game_data_dir;
+    auto *handle = xdl_open("libyuanshen.so", 0);
+    if (handle) {
+        install_genshin70_metadata_hook(handle, game_data_dir);
+        xdl_close(handle);
+    }
+#else
+    (void) library_path;
+    (void) game_data_dir;
+#endif
 }
 
 void hack_start(const char *game_data_dir) {
