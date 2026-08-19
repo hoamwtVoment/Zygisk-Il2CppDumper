@@ -25,6 +25,8 @@
 #include <cstdint>
 #include <fcntl.h>
 #include <fstream>
+#include <map>
+#include <set>
 #include <vector>
 
 namespace {
@@ -546,6 +548,187 @@ void capture_metadata_runtime_state(const char *game_data_dir, const char *phase
     write_status(game_data_dir, std::string("runtime state pair captured: ") + phase);
 }
 
+struct RuntimeHeapRegion {
+    uintptr_t begin;
+    size_t size;
+};
+
+std::vector<RuntimeHeapRegion> collect_runtime_heap_regions() {
+    std::vector<RuntimeHeapRegion> regions;
+    FILE *maps = fopen("/proc/self/maps", "r");
+    if (!maps) {
+        return regions;
+    }
+
+    char line[2048]{};
+    while (fgets(line, sizeof(line), maps)) {
+        unsigned long long begin_value = 0;
+        unsigned long long end_value = 0;
+        char permissions[5]{};
+        char pathname[1024]{};
+        const int fields = sscanf(line, "%llx-%llx %4s %*s %*s %*s %1023[^\n]",
+                                  &begin_value, &end_value, permissions, pathname);
+        if (fields < 3 || permissions[0] != 'r' || permissions[1] != 'w' ||
+            permissions[3] != 'p' || end_value <= begin_value) {
+            continue;
+        }
+
+        const char *path = fields >= 4 ? pathname : "";
+        while (*path == ' ') {
+            ++path;
+        }
+        if (*path != '\0' && strncmp(path, "[anon:", 6) != 0 &&
+            strcmp(path, "[heap]") != 0) {
+            continue;
+        }
+
+        const auto size = static_cast<size_t>(end_value - begin_value);
+        if (size < 0x1000 || size > 256ULL * 1024 * 1024) {
+            continue;
+        }
+        regions.push_back({static_cast<uintptr_t>(begin_value), size});
+    }
+    fclose(maps);
+    return regions;
+}
+
+void probe_runtime_target_names(const char *game_data_dir) {
+    constexpr const char *targets[] = {
+            "Miscs", "VCHumanoidMove", "ActorAbilityPlugin", "LCBaseCombat",
+            "BaseEntity", "CheckTargetAttackable", "NotifyLandVelocity",
+            "HanlderModifierThinkTimerUp", "GetPos", "GetPropValue", "SafeFloat",
+            "Avatar", "EntityActor", "Ability", "Hurt", "Damage", "ChangeHp",
+    };
+    constexpr size_t chunk_size = 4 * 1024 * 1024;
+    constexpr size_t maximum_hits_per_name = 64;
+    constexpr size_t maximum_xrefs = 512;
+
+    const auto regions = collect_runtime_heap_regions();
+    size_t total_size = 0;
+    for (const auto &region : regions) {
+        total_size += region.size;
+    }
+    write_status(game_data_dir, "runtime name probe started: mappings=" +
+                                    std::to_string(regions.size()) + " readable=" +
+                                    std::to_string(total_size / (1024 * 1024)) + " MiB");
+
+    std::map<std::string, std::vector<uintptr_t>> name_hits;
+    std::vector<uint8_t> buffer(chunk_size + 64);
+    size_t scanned = 0;
+    size_t next_progress = 128ULL * 1024 * 1024;
+    for (const auto &region : regions) {
+        for (size_t offset = 0; offset < region.size; offset += chunk_size) {
+            const auto primary = std::min(chunk_size, region.size - offset);
+            const auto request = std::min(primary + 63, region.size - offset);
+            if (!read_self_memory(region.begin + offset, buffer.data(), request)) {
+                scanned += primary;
+                continue;
+            }
+            for (const char *target : targets) {
+                const size_t length = strlen(target);
+                auto *cursor = buffer.data();
+                auto *end = buffer.data() + request;
+                while (cursor + length < end) {
+                    auto *hit = static_cast<uint8_t *>(
+                            memmem(cursor, static_cast<size_t>(end - cursor), target, length));
+                    if (!hit) {
+                        break;
+                    }
+                    const auto local_offset = static_cast<size_t>(hit - buffer.data());
+                    if (local_offset < primary && hit[length] == '\0') {
+                        auto &hits = name_hits[target];
+                        if (hits.size() < maximum_hits_per_name) {
+                            hits.push_back(region.begin + offset + local_offset);
+                        }
+                    }
+                    cursor = hit + 1;
+                }
+            }
+            scanned += primary;
+            if (scanned >= next_progress) {
+                write_status(game_data_dir, "runtime name probe progress: " +
+                                                std::to_string(scanned / (1024 * 1024)) + "/" +
+                                                std::to_string(total_size / (1024 * 1024)) +
+                                                " MiB");
+                next_progress += 128ULL * 1024 * 1024;
+            }
+        }
+    }
+
+    std::map<uintptr_t, std::string> targets_by_address;
+    size_t total_name_hits = 0;
+    for (const auto &[name, hits] : name_hits) {
+        total_name_hits += hits.size();
+        for (auto hit : hits) {
+            targets_by_address.emplace(hit, name);
+        }
+    }
+    write_status(game_data_dir, "runtime name probe strings complete: names=" +
+                                    std::to_string(name_hits.size()) + " hits=" +
+                                    std::to_string(total_name_hits));
+
+    const auto output_path = std::string(game_data_dir) + "/files/runtime-name-xrefs70.txt";
+    std::ofstream output(output_path, std::ios::trunc);
+    if (!output) {
+        write_status(game_data_dir, "runtime name probe failed: cannot create output");
+        return;
+    }
+    output << "runtime target name/xref probe 7.0\n";
+    output << "regions=" << regions.size() << " bytes=" << total_size << '\n';
+    for (const auto &[name, hits] : name_hits) {
+        output << "NAME " << name << " count=" << hits.size() << '\n';
+        for (auto hit : hits) {
+            output << "  string=0x" << std::hex << hit << std::dec << '\n';
+        }
+    }
+
+    size_t xref_count = 0;
+    if (!targets_by_address.empty()) {
+        for (const auto &region : regions) {
+            for (size_t offset = 0; offset < region.size && xref_count < maximum_xrefs;
+                 offset += chunk_size) {
+                const auto request = std::min(chunk_size, region.size - offset);
+                if (!read_self_memory(region.begin + offset, buffer.data(), request)) {
+                    continue;
+                }
+                for (size_t index = 0; index + sizeof(uintptr_t) <= request;
+                     index += sizeof(uintptr_t)) {
+                    uintptr_t value = 0;
+                    memcpy(&value, buffer.data() + index, sizeof(value));
+                    const auto target = targets_by_address.find(value);
+                    if (target == targets_by_address.end()) {
+                        continue;
+                    }
+
+                    const auto xref = region.begin + offset + index;
+                    output << "XREF name=" << target->second << " string=0x" << std::hex
+                           << value << " at=0x" << xref << std::dec << '\n';
+                    std::array<uint8_t, 0x100> context{};
+                    const auto context_begin = xref >= 0x40 ? xref - 0x40 : xref;
+                    if (read_self_memory(context_begin, context.data(), context.size())) {
+                        output << "  context=0x" << std::hex << context_begin << ':';
+                        for (auto byte : context) {
+                            char encoded[3]{};
+                            snprintf(encoded, sizeof(encoded), "%02x", byte);
+                            output << encoded;
+                        }
+                        output << std::dec << '\n';
+                    }
+                    if (++xref_count == maximum_xrefs) {
+                        break;
+                    }
+                }
+            }
+            if (xref_count == maximum_xrefs) {
+                break;
+            }
+        }
+    }
+    output.close();
+    write_status(game_data_dir, "runtime name probe complete: xrefs=" +
+                                    std::to_string(xref_count) + " output=" + output_path);
+}
+
 void probe_metadata_buffer_decoder(const char *game_data_dir, const void *metadata) {
     constexpr uintptr_t decoder_rva = 0x074B8990;
     constexpr size_t probe_size = 0x1000;
@@ -723,7 +906,17 @@ bool invoke_metadata_loader_for_dump(const char *game_data_dir) {
     dump_metadata_crypto_probe(game_data_dir);
     capture_metadata_runtime_state(game_data_dir, "after");
     if (!metadata_dump_started.exchange(true)) {
-        return dump_decrypted_metadata(metadata, metadata_dir.c_str());
+        const auto dumped = dump_decrypted_metadata(metadata, metadata_dir.c_str());
+        if (!dumped) {
+            return false;
+        }
+        for (int remaining = 30; remaining > 0; remaining -= 10) {
+            write_status(game_data_dir, "runtime name probe starts in " +
+                                            std::to_string(remaining) + " seconds");
+            sleep(10);
+        }
+        probe_runtime_target_names(game_data_dir);
+        return true;
     }
     return true;
 }
