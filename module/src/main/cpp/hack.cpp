@@ -25,7 +25,6 @@
 #include <cstdint>
 #include <fcntl.h>
 #include <fstream>
-#include <mutex>
 #include <vector>
 
 namespace {
@@ -63,7 +62,22 @@ std::atomic_bool metadata_hook_installed{false};
 MetadataCrypto original_metadata_crypto = nullptr;
 std::atomic_bool metadata_crypto_probe_installed{false};
 std::atomic<uint32_t> metadata_crypto_probe_calls{0};
-std::mutex metadata_crypto_probe_mutex;
+
+constexpr uint32_t kMetadataCryptoProbeCapacity = 1024;
+struct MetadataCryptoProbeRecord {
+    uint32_t magic;
+    uint32_t call;
+    uintptr_t args[5];
+    uint8_t before_x1[0x40];
+    uint8_t before_x2[0x40];
+    uint8_t before_x3[0x40];
+    uint8_t before_x4[0x40];
+    uint8_t after_x2[0x40];
+    uint8_t after_x3[0x40];
+    uint8_t after_x4[0x40];
+};
+std::array<MetadataCryptoProbeRecord, kMetadataCryptoProbeCapacity>
+        metadata_crypto_probe_records{};
 
 bool install_inline_hook(void *target, void *replacement, void **original);
 void dump_metadata_layout_probes(const char *game_data_dir, const void *metadata,
@@ -285,43 +299,48 @@ void hooked_metadata_crypto(void *context, void *state, void *key, void *output,
     if (!original) {
         return;
     }
-    original(context, state, key, output, input);
-
     const auto call = metadata_crypto_probe_calls.fetch_add(1);
-    if (call >= 16 || metadata_dump_dir.empty()) {
+    if (call >= kMetadataCryptoProbeCapacity) {
+        original(context, state, key, output, input);
         return;
     }
 
-    std::lock_guard<std::mutex> lock(metadata_crypto_probe_mutex);
-    struct ProbeRecord {
-        uint32_t magic;
-        uint32_t call;
-        uintptr_t context;
-        uintptr_t state;
-        uintptr_t key;
-        uintptr_t output;
-        uintptr_t input;
-        uint8_t output_bytes[0x40];
-        uint8_t input_bytes[0x40];
-    } record{};
+    auto &record = metadata_crypto_probe_records[call];
     record.magic = 0x50374347; // G7CP
     record.call = call;
-    record.context = reinterpret_cast<uintptr_t>(context);
-    record.state = reinterpret_cast<uintptr_t>(state);
-    record.key = reinterpret_cast<uintptr_t>(key);
-    record.output = reinterpret_cast<uintptr_t>(output);
-    record.input = reinterpret_cast<uintptr_t>(input);
-    read_self_memory(record.output, record.output_bytes, sizeof(record.output_bytes));
-    read_self_memory(record.input, record.input_bytes, sizeof(record.input_bytes));
+    record.args[0] = reinterpret_cast<uintptr_t>(context);
+    record.args[1] = reinterpret_cast<uintptr_t>(state);
+    record.args[2] = reinterpret_cast<uintptr_t>(key);
+    record.args[3] = reinterpret_cast<uintptr_t>(output);
+    record.args[4] = reinterpret_cast<uintptr_t>(input);
+    memcpy(record.before_x1, state, sizeof(record.before_x1));
+    memcpy(record.before_x2, key, sizeof(record.before_x2));
+    memcpy(record.before_x3, output, sizeof(record.before_x3));
+    memcpy(record.before_x4, input, sizeof(record.before_x4));
 
-    const auto path = metadata_dump_dir + "/files/metadata-crypto-probe70.bin";
-    int fd = open(path.c_str(), O_CREAT | O_APPEND | O_WRONLY | O_CLOEXEC, 0600);
-    if (fd != -1) {
-        (void)write(fd, &record, sizeof(record));
-        close(fd);
+    original(context, state, key, output, input);
+
+    memcpy(record.after_x2, key, sizeof(record.after_x2));
+    memcpy(record.after_x3, output, sizeof(record.after_x3));
+    memcpy(record.after_x4, input, sizeof(record.after_x4));
+}
+
+void dump_metadata_crypto_probe(const char *game_data_dir) {
+    const auto calls = metadata_crypto_probe_calls.load();
+    const auto records = calls < kMetadataCryptoProbeCapacity ? calls
+                                                               : kMetadataCryptoProbeCapacity;
+    const auto path = std::string(game_data_dir) + "/files/metadata-crypto-probe70.bin";
+    if (records == 0 ||
+        !write_blob_file(path, metadata_crypto_probe_records.data(),
+                         records * sizeof(MetadataCryptoProbeRecord))) {
+        write_status(game_data_dir, "metadata crypto probe dump failed; calls=" +
+                                       std::to_string(calls));
+        return;
     }
-    write_status(metadata_dump_dir.c_str(), "metadata crypto probe call=" +
-                                             std::to_string(call + 1) + "/16");
+    write_status(game_data_dir, "metadata crypto probe complete: captured=" +
+                                   std::to_string(records) + "/" +
+                                   std::to_string(calls) + " calls record_size=" +
+                                   std::to_string(sizeof(MetadataCryptoProbeRecord)));
 }
 
 bool install_metadata_crypto_probe(const char *game_data_dir) {
@@ -576,6 +595,7 @@ bool invoke_metadata_loader_for_dump(const char *game_data_dir) {
 
     write_status(game_data_dir, "active metadata loader returned: ptr=" +
                                     pointer_string(metadata));
+    dump_metadata_crypto_probe(game_data_dir);
     capture_metadata_runtime_state(game_data_dir);
     probe_metadata_buffer_decoder(game_data_dir, metadata);
     if (!metadata_dump_started.exchange(true)) {
