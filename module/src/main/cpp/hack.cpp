@@ -567,6 +567,8 @@ struct RuntimeClassCandidate {
     uintptr_t name_address;
 };
 
+std::vector<RuntimeHeapRegion> collect_runtime_heap_regions();
+
 #pragma pack(push, 1)
 struct RuntimeClassDumpHeader {
     uint32_t magic;
@@ -598,6 +600,27 @@ struct RuntimePointerDumpRecord {
     uint8_t writable;
     uint8_t executable;
     uint8_t reserved;
+};
+
+struct RuntimeMethodDumpHeader {
+    uint32_t magic;
+    uint32_t version;
+    uint32_t record_count;
+    uint32_t record_size;
+    uintptr_t module_base;
+    uint64_t scanned_bytes;
+};
+
+struct RuntimeMethodDumpRecord {
+    uintptr_t record_address;
+    uintptr_t class_address;
+    uintptr_t code_address;
+    uintptr_t invoker_address;
+    uint32_t token;
+    uint32_t reserved;
+    uint64_t flags;
+    uint64_t auxiliary;
+    char class_name[96];
 };
 #pragma pack(pop)
 
@@ -643,6 +666,216 @@ bool is_focus_runtime_class(const std::string &name) {
     return name == "Miscs" || name == "VCHumanoidMove" ||
            name == "ActorAbilityPlugin" || name == "EntityActor" ||
            name == "SafeFloat";
+}
+
+bool resolve_runtime_class_name(uintptr_t class_key, std::string &name) {
+    if (class_key < 0x28) {
+        return false;
+    }
+    const auto class_address = class_key - 0x28;
+    uintptr_t name_address = 0;
+    if (!read_self_memory(class_address + 0x40, &name_address, sizeof(name_address)) ||
+        !name_address) {
+        return false;
+    }
+
+    std::array<char, 96> buffer{};
+    if (!read_self_memory(name_address, buffer.data(), buffer.size())) {
+        return false;
+    }
+    size_t length = 0;
+    while (length < buffer.size() && buffer[length] >= 0x20 && buffer[length] <= 0x7E) {
+        ++length;
+    }
+    if (length < 2 || length == buffer.size() || buffer[length] != '\0') {
+        return false;
+    }
+    name.assign(buffer.data(), length);
+    return true;
+}
+
+bool is_runtime_class_object(const RuntimeClassCandidate &candidate,
+                             const std::vector<RuntimeReadableRegion> &regions) {
+    std::array<uint8_t, 0x130> data{};
+    if (!read_self_memory(candidate.address, data.data(), data.size())) {
+        return false;
+    }
+    uintptr_t code = 0;
+    uintptr_t method_info = 0;
+    memcpy(&code, data.data() + 0xF8, sizeof(code));
+    memcpy(&method_info, data.data() + 0x100, sizeof(method_info));
+    const auto *code_region = find_runtime_region(regions, code);
+    if (!code_region || !code_region->executable || !method_info) {
+        return false;
+    }
+
+    std::array<uint64_t, 7> method{};
+    if (!read_self_memory(method_info, method.data(), sizeof(method))) {
+        return false;
+    }
+    return method[0] == candidate.address + 0x28 && method[1] == code &&
+           method[4] == 0xFFFFFFFFULL;
+}
+
+void dump_all_runtime_methods(const char *game_data_dir,
+                              const std::vector<RuntimeClassCandidate> &candidates) {
+    constexpr size_t chunk_size = 4 * 1024 * 1024;
+    constexpr size_t method_size = 0x38;
+    const auto readable_regions = collect_runtime_readable_regions();
+    const auto heap_regions = collect_runtime_heap_regions();
+
+    std::set<std::pair<uintptr_t, size_t>> selected_ranges;
+    for (const auto &candidate : candidates) {
+        if (!is_runtime_class_object(candidate, readable_regions)) {
+            continue;
+        }
+        for (const auto &region : heap_regions) {
+            if (candidate.address >= region.begin &&
+                candidate.address < region.begin + region.size) {
+                selected_ranges.emplace(region.begin, region.size);
+                write_status(game_data_dir, "runtime method scan seed: class=" +
+                                                candidate.name + " address=" +
+                                                pointer_string(reinterpret_cast<void *>(
+                                                        candidate.address)) +
+                                                " region=" +
+                                                pointer_string(reinterpret_cast<void *>(
+                                                        region.begin)) +
+                                                " size=" +
+                                                std::to_string(region.size / (1024 * 1024)) +
+                                                " MiB");
+                break;
+            }
+        }
+    }
+    if (selected_ranges.empty()) {
+        write_status(game_data_dir,
+                     "runtime method scan failed: no validated class allocation region");
+        return;
+    }
+
+    uint64_t total_size = 0;
+    for (const auto &[begin, size] : selected_ranges) {
+        (void)begin;
+        total_size += size;
+    }
+    write_status(game_data_dir, "runtime method scan started: regions=" +
+                                    std::to_string(selected_ranges.size()) + " readable=" +
+                                    std::to_string(total_size / (1024 * 1024)) + " MiB");
+
+    std::vector<RuntimeMethodDumpRecord> methods;
+    std::map<uintptr_t, std::string> class_names;
+    std::set<uintptr_t> rejected_classes;
+    std::vector<uint8_t> buffer(chunk_size + method_size);
+    uint64_t scanned = 0;
+    uint64_t next_progress = 16ULL * 1024 * 1024;
+    for (const auto &[region_begin, region_size] : selected_ranges) {
+        for (size_t offset = 0; offset < region_size; offset += chunk_size) {
+            const auto primary = std::min(chunk_size, region_size - offset);
+            const auto request = std::min(primary + method_size - 1,
+                                          region_size - offset);
+            if (!read_self_memory(region_begin + offset, buffer.data(), request)) {
+                scanned += primary;
+                continue;
+            }
+            for (size_t index = 0; index + method_size <= request && index < primary;
+                 index += sizeof(uintptr_t)) {
+                uint64_t fields[7]{};
+                memcpy(fields, buffer.data() + index, sizeof(fields));
+                const auto *code_region = find_runtime_region(readable_regions, fields[1]);
+                const auto *invoker_region = find_runtime_region(readable_regions, fields[2]);
+                if (!code_region || !code_region->executable || !invoker_region ||
+                    !invoker_region->executable || fields[3] == 0 ||
+                    fields[3] > 0xFFFFFF || fields[4] != 0xFFFFFFFFULL ||
+                    (fields[0] & 7) != 0) {
+                    continue;
+                }
+
+                auto class_iterator = class_names.find(fields[0]);
+                if (class_iterator == class_names.end()) {
+                    if (rejected_classes.count(fields[0]) != 0) {
+                        continue;
+                    }
+                    std::string class_name;
+                    if (!resolve_runtime_class_name(fields[0], class_name)) {
+                        rejected_classes.insert(fields[0]);
+                        continue;
+                    }
+                    class_iterator = class_names.emplace(fields[0], std::move(class_name)).first;
+                }
+
+                RuntimeMethodDumpRecord record{};
+                record.record_address = region_begin + offset + index;
+                record.class_address = fields[0] - 0x28;
+                record.code_address = fields[1];
+                record.invoker_address = fields[2];
+                record.token = static_cast<uint32_t>(fields[3]);
+                record.flags = fields[5];
+                record.auxiliary = fields[6];
+                strncpy(record.class_name, class_iterator->second.c_str(),
+                        sizeof(record.class_name) - 1);
+                methods.push_back(record);
+            }
+            scanned += primary;
+            if (scanned >= next_progress) {
+                write_status(game_data_dir, "runtime method scan progress: " +
+                                                std::to_string(scanned / (1024 * 1024)) +
+                                                "/" +
+                                                std::to_string(total_size / (1024 * 1024)) +
+                                                " MiB methods=" +
+                                                std::to_string(methods.size()) +
+                                                " classes=" +
+                                                std::to_string(class_names.size()));
+                next_progress += 16ULL * 1024 * 1024;
+            }
+        }
+    }
+
+    std::sort(methods.begin(), methods.end(), [](const auto &left, const auto &right) {
+        return left.record_address < right.record_address;
+    });
+    methods.erase(std::unique(methods.begin(), methods.end(),
+                              [](const auto &left, const auto &right) {
+                                  return left.record_address == right.record_address;
+                              }),
+                  methods.end());
+
+    const auto binary_path = std::string(game_data_dir) +
+                             "/files/runtime-all-methods70.bin";
+    RuntimeMethodDumpHeader header{0x4D374147, 1,
+                                   static_cast<uint32_t>(methods.size()),
+                                   static_cast<uint32_t>(sizeof(RuntimeMethodDumpRecord)),
+                                   genshin_module_base, scanned}; // GA7M
+    std::ofstream binary(binary_path, std::ios::binary | std::ios::trunc);
+    if (!binary) {
+        write_status(game_data_dir,
+                     "runtime method scan failed: cannot create binary output");
+        return;
+    }
+    binary.write(reinterpret_cast<const char *>(&header), sizeof(header));
+    if (!methods.empty()) {
+        binary.write(reinterpret_cast<const char *>(methods.data()),
+                     methods.size() * sizeof(RuntimeMethodDumpRecord));
+    }
+    binary.flush();
+
+    const auto csv_path = std::string(game_data_dir) +
+                          "/files/runtime-all-methods70.csv";
+    std::ofstream csv(csv_path, std::ios::trunc);
+    if (csv) {
+        csv << "record_address,class_address,class_name,token,code_rva,invoker_rva,flags,auxiliary\n";
+        for (const auto &method : methods) {
+            csv << "0x" << std::hex << method.record_address << ",0x"
+                << method.class_address << ',' << method.class_name << ",0x"
+                << method.token << ",0x" << method.code_address - genshin_module_base
+                << ",0x" << method.invoker_address - genshin_module_base << ",0x"
+                << method.flags << ",0x" << method.auxiliary << std::dec << '\n';
+        }
+        csv.flush();
+    }
+    write_status(game_data_dir, "runtime method scan complete: methods=" +
+                                    std::to_string(methods.size()) + " classes=" +
+                                    std::to_string(class_names.size()) + " binary=" +
+                                    binary_path + " csv=" + csv_path);
 }
 
 void dump_runtime_class_records(const char *game_data_dir,
@@ -1052,7 +1285,8 @@ void probe_runtime_target_names(const char *game_data_dir) {
                                     std::to_string(xref_count) + " output=" + output_path);
     write_status(game_data_dir, "runtime class probe starts: candidates=" +
                                     std::to_string(class_candidates.size()));
-    dump_runtime_class_records(game_data_dir, std::move(class_candidates));
+    dump_runtime_class_records(game_data_dir, class_candidates);
+    dump_all_runtime_methods(game_data_dir, class_candidates);
 }
 
 void probe_metadata_buffer_decoder(const char *game_data_dir, const void *metadata) {
