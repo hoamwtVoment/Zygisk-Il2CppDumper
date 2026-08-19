@@ -722,26 +722,30 @@ void dump_all_runtime_methods(const char *game_data_dir,
     constexpr size_t chunk_size = 4 * 1024 * 1024;
     constexpr size_t method_size = 0x38;
     const auto readable_regions = collect_runtime_readable_regions();
-    const auto heap_regions = collect_runtime_heap_regions();
 
     std::set<std::pair<uintptr_t, size_t>> selected_ranges;
     for (const auto &candidate : candidates) {
-        if (!is_runtime_class_object(candidate, readable_regions)) {
+        const bool validated = is_runtime_class_object(candidate, readable_regions);
+        if (!validated && candidate.address >= genshin_module_base) {
             continue;
         }
-        for (const auto &region : heap_regions) {
-            if (candidate.address >= region.begin &&
-                candidate.address < region.begin + region.size) {
-                selected_ranges.emplace(region.begin, region.size);
+        for (const auto &region : readable_regions) {
+            const auto region_size = region.end - region.begin;
+            if (candidate.address >= region.begin && candidate.address < region.end &&
+                region.writable && !region.executable && region_size >= 1024 * 1024 &&
+                region_size <= 768ULL * 1024 * 1024) {
+                selected_ranges.emplace(region.begin, static_cast<size_t>(region_size));
                 write_status(game_data_dir, "runtime method scan seed: class=" +
                                                 candidate.name + " address=" +
                                                 pointer_string(reinterpret_cast<void *>(
                                                         candidate.address)) +
+                                                " validated=" +
+                                                (validated ? "yes" : "fallback") +
                                                 " region=" +
                                                 pointer_string(reinterpret_cast<void *>(
                                                         region.begin)) +
                                                 " size=" +
-                                                std::to_string(region.size / (1024 * 1024)) +
+                                                std::to_string(region_size / (1024 * 1024)) +
                                                 " MiB");
                 break;
             }
