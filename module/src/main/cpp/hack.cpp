@@ -52,6 +52,7 @@ using MetadataLoader = void *(*)(const char *metadata_dir);
 using MetadataBufferDecoder = int (*)(void *buffer, uint32_t length);
 using MetadataCrypto = void (*)(void *context, void *state, void *key, void *output,
                                 void *input);
+using MetadataWholeTransform = void *(*)(void *buffer, uint32_t length);
 
 void *original_metadata_loader = nullptr;
 uintptr_t genshin_module_base = 0;
@@ -60,8 +61,11 @@ std::atomic_bool metadata_dump_started{false};
 std::atomic_bool metadata_hook_installing{false};
 std::atomic_bool metadata_hook_installed{false};
 MetadataCrypto original_metadata_crypto = nullptr;
+MetadataWholeTransform original_metadata_whole_transform = nullptr;
 std::atomic_bool metadata_crypto_probe_installed{false};
+std::atomic_bool metadata_whole_probe_installed{false};
 std::atomic<uint32_t> metadata_crypto_probe_calls{0};
+std::atomic<uint32_t> metadata_whole_probe_calls{0};
 
 constexpr uint32_t kMetadataCryptoProbeCapacity = 1024;
 struct MetadataCryptoProbeRecord {
@@ -343,6 +347,120 @@ void dump_metadata_crypto_probe(const char *game_data_dir) {
                                    std::to_string(sizeof(MetadataCryptoProbeRecord)));
 }
 
+void *hooked_metadata_whole_transform(void *buffer, uint32_t length) {
+    auto original = original_metadata_whole_transform;
+    if (!original) {
+        return nullptr;
+    }
+
+    const auto call = metadata_whole_probe_calls.fetch_add(1);
+    const auto sample_size = length < 0x1000 ? length : 0x1000;
+    std::array<uint8_t, 0x1000> before{};
+    if (call < 8 && buffer && sample_size > 0) {
+        read_self_memory(reinterpret_cast<uintptr_t>(buffer), before.data(), sample_size);
+    }
+
+    auto result = original(buffer, length);
+    if (call >= 8 || !buffer || sample_size == 0 || metadata_dump_dir.empty()) {
+        return result;
+    }
+
+    struct WholeProbeRecord {
+        uint32_t magic;
+        uint32_t call;
+        uintptr_t buffer;
+        uint32_t length;
+        uint32_t sample_size;
+        uintptr_t result;
+        uint8_t before[0x1000];
+        uint8_t after[0x1000];
+    } record{};
+    record.magic = 0x57374347; // G7CW
+    record.call = call;
+    record.buffer = reinterpret_cast<uintptr_t>(buffer);
+    record.length = length;
+    record.sample_size = sample_size;
+    record.result = reinterpret_cast<uintptr_t>(result);
+    memcpy(record.before, before.data(), sample_size);
+    read_self_memory(reinterpret_cast<uintptr_t>(buffer), record.after, sample_size);
+
+    const auto path = metadata_dump_dir + "/files/metadata-whole-probe70.bin";
+    int fd = open(path.c_str(), O_CREAT | O_APPEND | O_WRONLY | O_CLOEXEC, 0600);
+    if (fd != -1) {
+        (void)write(fd, &record, sizeof(record));
+        close(fd);
+    }
+    write_status(metadata_dump_dir.c_str(), "metadata whole-transform call=" +
+                                             std::to_string(call + 1) + "/8 length=" +
+                                             std::to_string(length));
+    return result;
+}
+
+bool install_metadata_whole_probe(const char *game_data_dir) {
+    if (metadata_whole_probe_installed.load()) {
+        return true;
+    }
+    auto target = reinterpret_cast<void *>(genshin_module_base + 0x074B9A68);
+    metadata_whole_probe_calls.store(0);
+    unlink((metadata_dump_dir + "/files/metadata-whole-probe70.bin").c_str());
+    void *trampoline = nullptr;
+    if (!install_inline_hook(target, reinterpret_cast<void *>(hooked_metadata_whole_transform),
+                             &trampoline)) {
+        write_status(game_data_dir,
+                     "metadata whole-transform probe hook install failed at RVA 0x74B9A68");
+        return false;
+    }
+    original_metadata_whole_transform = reinterpret_cast<MetadataWholeTransform>(trampoline);
+    metadata_whole_probe_installed.store(true);
+    write_status(game_data_dir,
+                 "metadata whole-transform probe hook installed at RVA 0x74B9A68");
+    return true;
+}
+
+void run_metadata_whole_transform_probe(const char *game_data_dir, const void *metadata,
+                                        const char *metadata_dir) {
+    if (!original_metadata_whole_transform || !metadata) {
+        write_status(game_data_dir, "active metadata whole-transform skipped: unavailable");
+        return;
+    }
+
+    const auto source_path = metadata_source_path(metadata_dir);
+    struct stat source_stat{};
+    if (stat(source_path.c_str(), &source_stat) != 0 || source_stat.st_size <= 0 ||
+        source_stat.st_size > 512LL * 1024 * 1024) {
+        write_status(game_data_dir, "active metadata whole-transform skipped: invalid size");
+        return;
+    }
+    const auto metadata_size = static_cast<size_t>(source_stat.st_size);
+    auto *copy = static_cast<uint8_t *>(mmap(nullptr, metadata_size, PROT_READ | PROT_WRITE,
+                                              MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    if (copy == MAP_FAILED) {
+        write_status(game_data_dir, "active metadata whole-transform failed: mmap errno=" +
+                                       std::to_string(errno));
+        return;
+    }
+
+    write_status(game_data_dir, "actively invoking metadata whole-transform on copy; size=" +
+                                   std::to_string(metadata_size));
+    memcpy(copy, metadata, metadata_size);
+    auto *result = hooked_metadata_whole_transform(copy,
+                                                    static_cast<uint32_t>(metadata_size));
+    const auto *output = result ? static_cast<const uint8_t *>(result) : copy;
+    char magic[32]{};
+    snprintf(magic, sizeof(magic), "%02X %02X %02X %02X", output[0], output[1], output[2],
+             output[3]);
+    const auto output_path = std::string(game_data_dir) +
+                             "/files/global-metadata-whole-transform70.dat";
+    if (write_blob_file(output_path, output, metadata_size)) {
+        write_status(game_data_dir, "metadata whole-transform complete: " + output_path +
+                                       " (" + std::to_string(metadata_size) +
+                                       " bytes, magic=" + magic + ")");
+    } else {
+        write_status(game_data_dir, "metadata whole-transform output write failed");
+    }
+    munmap(copy, metadata_size);
+}
+
 bool install_metadata_crypto_probe(const char *game_data_dir) {
     if (metadata_crypto_probe_installed.load()) {
         return true;
@@ -359,6 +477,7 @@ bool install_metadata_crypto_probe(const char *game_data_dir) {
     original_metadata_crypto = reinterpret_cast<MetadataCrypto>(trampoline);
     metadata_crypto_probe_installed.store(true);
     write_status(game_data_dir, "metadata crypto probe hook installed at RVA 0x74B6404");
+    install_metadata_whole_probe(game_data_dir);
     return true;
 }
 
@@ -596,6 +715,7 @@ bool invoke_metadata_loader_for_dump(const char *game_data_dir) {
     write_status(game_data_dir, "active metadata loader returned: ptr=" +
                                     pointer_string(metadata));
     dump_metadata_crypto_probe(game_data_dir);
+    run_metadata_whole_transform_probe(game_data_dir, metadata, metadata_dir.c_str());
     capture_metadata_runtime_state(game_data_dir);
     probe_metadata_buffer_decoder(game_data_dir, metadata);
     if (!metadata_dump_started.exchange(true)) {
