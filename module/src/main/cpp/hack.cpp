@@ -20,6 +20,7 @@
 #include <linux/unistd.h>
 #include <array>
 #include <atomic>
+#include <algorithm>
 #include <cerrno>
 #include <cinttypes>
 #include <cstdint>
@@ -553,6 +554,216 @@ struct RuntimeHeapRegion {
     size_t size;
 };
 
+struct RuntimeReadableRegion {
+    uintptr_t begin;
+    uintptr_t end;
+    bool writable;
+    bool executable;
+};
+
+struct RuntimeClassCandidate {
+    std::string name;
+    uintptr_t address;
+    uintptr_t name_address;
+};
+
+#pragma pack(push, 1)
+struct RuntimeClassDumpHeader {
+    uint32_t magic;
+    uint32_t version;
+    uint32_t candidate_count;
+    uint32_t class_snapshot_size;
+    uint32_t pointer_snapshot_size;
+    uint32_t reserved;
+    uintptr_t module_base;
+};
+
+struct RuntimeClassDumpRecord {
+    uint32_t magic;
+    uint32_t record_size;
+    char name[48];
+    uintptr_t class_address;
+    uintptr_t name_address;
+    uint32_t class_data_size;
+    uint32_t pointer_count;
+};
+
+struct RuntimePointerDumpRecord {
+    uint32_t magic;
+    uint32_t source_offset;
+    uintptr_t target_address;
+    uint32_t data_size;
+    uint8_t writable;
+    uint8_t executable;
+    uint16_t reserved;
+};
+#pragma pack(pop)
+
+std::vector<RuntimeReadableRegion> collect_runtime_readable_regions() {
+    std::vector<RuntimeReadableRegion> regions;
+    FILE *maps = fopen("/proc/self/maps", "r");
+    if (!maps) {
+        return regions;
+    }
+
+    char line[2048]{};
+    while (fgets(line, sizeof(line), maps)) {
+        unsigned long long begin_value = 0;
+        unsigned long long end_value = 0;
+        char permissions[5]{};
+        if (sscanf(line, "%llx-%llx %4s", &begin_value, &end_value, permissions) < 3 ||
+            permissions[0] != 'r' || end_value <= begin_value) {
+            continue;
+        }
+        regions.push_back({static_cast<uintptr_t>(begin_value),
+                           static_cast<uintptr_t>(end_value), permissions[1] == 'w',
+                           permissions[2] == 'x'});
+    }
+    fclose(maps);
+    return regions;
+}
+
+const RuntimeReadableRegion *find_runtime_region(
+        const std::vector<RuntimeReadableRegion> &regions, uintptr_t address) {
+    const auto iterator = std::upper_bound(
+            regions.begin(), regions.end(), address,
+            [](uintptr_t value, const RuntimeReadableRegion &region) {
+                return value < region.begin;
+            });
+    if (iterator == regions.begin()) {
+        return nullptr;
+    }
+    const auto &region = *(iterator - 1);
+    return address >= region.begin && address < region.end ? &region : nullptr;
+}
+
+bool is_focus_runtime_class(const std::string &name) {
+    return name == "Miscs" || name == "VCHumanoidMove" ||
+           name == "ActorAbilityPlugin" || name == "EntityActor" ||
+           name == "SafeFloat";
+}
+
+void dump_runtime_class_records(const char *game_data_dir,
+                                std::vector<RuntimeClassCandidate> candidates) {
+    constexpr size_t class_snapshot_size = 0x400;
+    constexpr size_t pointer_snapshot_size = 0x800;
+    constexpr size_t maximum_pointer_snapshots = 96;
+
+    std::sort(candidates.begin(), candidates.end(),
+              [](const auto &left, const auto &right) {
+                  if (left.name != right.name) {
+                      return left.name < right.name;
+                  }
+                  return left.address < right.address;
+              });
+    candidates.erase(std::unique(candidates.begin(), candidates.end(),
+                                 [](const auto &left, const auto &right) {
+                                     return left.name == right.name &&
+                                            left.address == right.address;
+                                 }),
+                     candidates.end());
+
+    const auto regions = collect_runtime_readable_regions();
+    const auto binary_path = std::string(game_data_dir) +
+                             "/files/runtime-class-records70.bin";
+    const auto index_path = std::string(game_data_dir) +
+                            "/files/runtime-class-records70.txt";
+    std::ofstream binary(binary_path, std::ios::binary | std::ios::trunc);
+    std::ofstream index(index_path, std::ios::trunc);
+    if (!binary || !index) {
+        write_status(game_data_dir,
+                     "runtime class probe failed: cannot create output files");
+        return;
+    }
+
+    RuntimeClassDumpHeader header{0x52433747, 1, 0,
+                                  static_cast<uint32_t>(class_snapshot_size),
+                                  static_cast<uint32_t>(pointer_snapshot_size), 0,
+                                  genshin_module_base}; // G7CR
+    binary.write(reinterpret_cast<const char *>(&header), sizeof(header));
+    index << "runtime class/method-table probe 7.0\n";
+    index << "module_base=0x" << std::hex << genshin_module_base << std::dec << '\n';
+
+    uint32_t written_candidates = 0;
+    for (const auto &candidate : candidates) {
+        std::array<uint8_t, class_snapshot_size> class_data{};
+        const auto *class_region = find_runtime_region(regions, candidate.address);
+        if (!class_region || class_region->end - candidate.address < class_data.size() ||
+            !read_self_memory(candidate.address, class_data.data(), class_data.size())) {
+            continue;
+        }
+
+        struct PointerSnapshot {
+            RuntimePointerDumpRecord record;
+            std::vector<uint8_t> data;
+        };
+        std::vector<PointerSnapshot> pointers;
+        std::set<uintptr_t> captured_targets;
+        for (size_t offset = 0;
+             offset + sizeof(uintptr_t) <= class_data.size() &&
+             pointers.size() < maximum_pointer_snapshots;
+             offset += sizeof(uintptr_t)) {
+            uintptr_t target = 0;
+            memcpy(&target, class_data.data() + offset, sizeof(target));
+            const auto *target_region = find_runtime_region(regions, target);
+            if (!target_region || target_region->end - target < 0x20 ||
+                !captured_targets.insert(target).second) {
+                continue;
+            }
+            const auto data_size = static_cast<size_t>(std::min<uintptr_t>(
+                    pointer_snapshot_size, target_region->end - target));
+            PointerSnapshot snapshot{};
+            snapshot.record = {0x50523747, static_cast<uint32_t>(offset), target,
+                               static_cast<uint32_t>(data_size),
+                               static_cast<uint8_t>(target_region->writable),
+                               static_cast<uint8_t>(target_region->executable), 0}; // G7RP
+            snapshot.data.resize(data_size);
+            if (!read_self_memory(target, snapshot.data.data(), snapshot.data.size())) {
+                continue;
+            }
+            pointers.push_back(std::move(snapshot));
+        }
+
+        RuntimeClassDumpRecord record{};
+        record.magic = 0x43433747; // G7CC
+        strncpy(record.name, candidate.name.c_str(), sizeof(record.name) - 1);
+        record.class_address = candidate.address;
+        record.name_address = candidate.name_address;
+        record.class_data_size = class_data.size();
+        record.pointer_count = pointers.size();
+        record.record_size = sizeof(record) + class_data.size();
+        for (const auto &pointer : pointers) {
+            record.record_size += sizeof(pointer.record) + pointer.data.size();
+        }
+        binary.write(reinterpret_cast<const char *>(&record), sizeof(record));
+        binary.write(reinterpret_cast<const char *>(class_data.data()), class_data.size());
+        index << "CLASS name=" << candidate.name << " address=0x" << std::hex
+              << candidate.address << " name_address=0x" << candidate.name_address
+              << std::dec << " pointers=" << pointers.size() << '\n';
+        for (const auto &pointer : pointers) {
+            binary.write(reinterpret_cast<const char *>(&pointer.record),
+                         sizeof(pointer.record));
+            binary.write(reinterpret_cast<const char *>(pointer.data.data()),
+                         pointer.data.size());
+            index << "  PTR source=+0x" << std::hex << pointer.record.source_offset
+                  << " target=0x" << pointer.record.target_address << std::dec
+                  << " size=" << pointer.record.data_size
+                  << " writable=" << static_cast<int>(pointer.record.writable)
+                  << " executable=" << static_cast<int>(pointer.record.executable) << '\n';
+        }
+        ++written_candidates;
+    }
+
+    header.candidate_count = written_candidates;
+    binary.seekp(0);
+    binary.write(reinterpret_cast<const char *>(&header), sizeof(header));
+    binary.flush();
+    index.flush();
+    write_status(game_data_dir, "runtime class probe complete: classes=" +
+                                    std::to_string(written_candidates) +
+                                    " binary=" + binary_path + " index=" + index_path);
+}
+
 std::vector<RuntimeHeapRegion> collect_runtime_heap_regions() {
     std::vector<RuntimeHeapRegion> regions;
     FILE *maps = fopen("/proc/self/maps", "r");
@@ -683,6 +894,7 @@ void probe_runtime_target_names(const char *game_data_dir) {
     }
 
     size_t xref_count = 0;
+    std::vector<RuntimeClassCandidate> class_candidates;
     if (!targets_by_address.empty()) {
         for (const auto &region : regions) {
             for (size_t offset = 0; offset < region.size && xref_count < maximum_xrefs;
@@ -701,6 +913,27 @@ void probe_runtime_target_names(const char *game_data_dir) {
                     }
 
                     const auto xref = region.begin + offset + index;
+                    if (is_focus_runtime_class(target->second) && xref >= 0x40) {
+                        const auto class_address = xref - 0x40;
+                        std::array<uint8_t, 0x100> class_header{};
+                        uintptr_t verified_name = 0;
+                        if (read_self_memory(class_address, class_header.data(),
+                                             class_header.size())) {
+                            memcpy(&verified_name, class_header.data() + 0x40,
+                                   sizeof(verified_name));
+                            uint32_t type_index = 0;
+                            uint32_t repeated_type_index = 0;
+                            memcpy(&type_index, class_header.data() + 0x78,
+                                   sizeof(type_index));
+                            memcpy(&repeated_type_index, class_header.data() + 0xA8,
+                                   sizeof(repeated_type_index));
+                            if (verified_name == value && type_index != 0 &&
+                                type_index == repeated_type_index) {
+                                class_candidates.push_back(
+                                        {target->second, class_address, value});
+                            }
+                        }
+                    }
                     output << "XREF name=" << target->second << " string=0x" << std::hex
                            << value << " at=0x" << xref << std::dec << '\n';
                     std::array<uint8_t, 0x100> context{};
@@ -727,6 +960,9 @@ void probe_runtime_target_names(const char *game_data_dir) {
     output.close();
     write_status(game_data_dir, "runtime name probe complete: xrefs=" +
                                     std::to_string(xref_count) + " output=" + output_path);
+    write_status(game_data_dir, "runtime class probe starts: candidates=" +
+                                    std::to_string(class_candidates.size()));
+    dump_runtime_class_records(game_data_dir, std::move(class_candidates));
 }
 
 void probe_metadata_buffer_decoder(const char *game_data_dir, const void *metadata) {
