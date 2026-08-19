@@ -25,6 +25,7 @@
 #include <cstdint>
 #include <fcntl.h>
 #include <fstream>
+#include <mutex>
 #include <vector>
 
 namespace {
@@ -50,6 +51,8 @@ constexpr uint32_t kGenshin70MetadataLoaderPrologue[] = {
 
 using MetadataLoader = void *(*)(const char *metadata_dir);
 using MetadataBufferDecoder = int (*)(void *buffer, uint32_t length);
+using MetadataCrypto = void (*)(void *context, void *state, void *key, void *output,
+                                void *input);
 
 void *original_metadata_loader = nullptr;
 uintptr_t genshin_module_base = 0;
@@ -57,6 +60,14 @@ std::string metadata_dump_dir;
 std::atomic_bool metadata_dump_started{false};
 std::atomic_bool metadata_hook_installing{false};
 std::atomic_bool metadata_hook_installed{false};
+MetadataCrypto original_metadata_crypto = nullptr;
+std::atomic_bool metadata_crypto_probe_installed{false};
+std::atomic<uint32_t> metadata_crypto_probe_calls{0};
+std::mutex metadata_crypto_probe_mutex;
+
+bool install_inline_hook(void *target, void *replacement, void **original);
+void dump_metadata_layout_probes(const char *game_data_dir, const void *metadata,
+                                 size_t metadata_size);
 
 std::string pointer_string(const void *value) {
     char buffer[32]{};
@@ -104,6 +115,7 @@ bool dump_decrypted_metadata(const void *metadata, const char *metadata_dir) {
     write_status(metadata_dump_dir.c_str(), "metadata decrypted: ptr=" + pointer_string(metadata) +
                                                " size=" + std::to_string(metadata_size) +
                                                " magic=" + magic);
+    dump_metadata_layout_probes(metadata_dump_dir.c_str(), metadata, metadata_size);
 
     auto output_path = metadata_dump_dir + "/files/global-metadata-decrypted70.dat";
     int fd = open(output_path.c_str(), O_CREAT | O_TRUNC | O_WRONLY | O_CLOEXEC, 0600);
@@ -192,6 +204,142 @@ bool dump_runtime_blob(const char *game_data_dir, const char *file_name, uintptr
     close(fd);
     write_status(game_data_dir, "runtime state captured: " + output_path + " (" +
                                     std::to_string(size) + " bytes)");
+    return true;
+}
+
+bool write_blob_file(const std::string &path, const void *data, size_t size) {
+    int fd = open(path.c_str(), O_CREAT | O_TRUNC | O_WRONLY | O_CLOEXEC, 0600);
+    if (fd == -1) {
+        return false;
+    }
+    const auto *bytes = static_cast<const uint8_t *>(data);
+    size_t written_total = 0;
+    while (written_total < size) {
+        auto written = write(fd, bytes + written_total, size - written_total);
+        if (written < 0 && errno == EINTR) {
+            continue;
+        }
+        if (written <= 0) {
+            close(fd);
+            return false;
+        }
+        written_total += static_cast<size_t>(written);
+    }
+    fsync(fd);
+    close(fd);
+    return true;
+}
+
+void dump_metadata_layout_probes(const char *game_data_dir, const void *metadata,
+                                 size_t metadata_size) {
+    const auto *base = static_cast<const uint8_t *>(metadata);
+    const auto dump = [&](const char *name, size_t offset, size_t size) {
+        if (offset > metadata_size || size > metadata_size - offset) {
+            write_status(game_data_dir, std::string("metadata probe skipped: ") + name);
+            return;
+        }
+        std::vector<uint8_t> bytes(size);
+        if (!read_self_memory(reinterpret_cast<uintptr_t>(base + offset), bytes.data(), size) ||
+            !write_blob_file(std::string(game_data_dir) + "/files/" + name, bytes.data(), size)) {
+            write_status(game_data_dir, std::string("metadata probe failed: ") + name);
+            return;
+        }
+        write_status(game_data_dir, std::string("metadata probe written: ") + name +
+                                       " (" + std::to_string(size) + " bytes, offset=0x" +
+                                       [&] { char b[32]{}; snprintf(b, sizeof(b), "%zX", offset); return std::string(b); }() + ")");
+    };
+
+    dump("metadata-buffer-head70.bin", 0, 0x1000);
+    dump("metadata-buffer-plus80070.bin", 0x800, 0x1000);
+    const size_t tail_size = metadata_size < 0x4000 ? metadata_size : 0x4000;
+    dump("metadata-buffer-tail70.bin", metadata_size - tail_size, tail_size);
+
+    constexpr size_t block_stride = 0x4AF40;
+    constexpr size_t block_count = 256;
+    std::vector<uint8_t> block_heads;
+    block_heads.reserve(block_count * 0x40);
+    for (size_t i = 0; i < block_count; ++i) {
+        const size_t offset = i * block_stride;
+        if (offset + 0x40 > metadata_size) {
+            break;
+        }
+        const auto old_size = block_heads.size();
+        block_heads.resize(old_size + 0x40);
+        if (!read_self_memory(reinterpret_cast<uintptr_t>(base + offset),
+                              block_heads.data() + old_size, 0x40)) {
+            block_heads.resize(old_size);
+            break;
+        }
+    }
+    if (!block_heads.empty() &&
+        write_blob_file(std::string(game_data_dir) + "/files/metadata-block-heads70.bin",
+                        block_heads.data(), block_heads.size())) {
+        write_status(game_data_dir, "metadata probe written: metadata-block-heads70.bin (" +
+                                       std::to_string(block_heads.size()) +
+                                       " bytes, stride=0x4AF40)");
+    }
+}
+
+void hooked_metadata_crypto(void *context, void *state, void *key, void *output, void *input) {
+    auto original = original_metadata_crypto;
+    if (!original) {
+        return;
+    }
+    original(context, state, key, output, input);
+
+    const auto call = metadata_crypto_probe_calls.fetch_add(1);
+    if (call >= 16 || metadata_dump_dir.empty()) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(metadata_crypto_probe_mutex);
+    struct ProbeRecord {
+        uint32_t magic;
+        uint32_t call;
+        uintptr_t context;
+        uintptr_t state;
+        uintptr_t key;
+        uintptr_t output;
+        uintptr_t input;
+        uint8_t output_bytes[0x40];
+        uint8_t input_bytes[0x40];
+    } record{};
+    record.magic = 0x50374347; // G7CP
+    record.call = call;
+    record.context = reinterpret_cast<uintptr_t>(context);
+    record.state = reinterpret_cast<uintptr_t>(state);
+    record.key = reinterpret_cast<uintptr_t>(key);
+    record.output = reinterpret_cast<uintptr_t>(output);
+    record.input = reinterpret_cast<uintptr_t>(input);
+    read_self_memory(record.output, record.output_bytes, sizeof(record.output_bytes));
+    read_self_memory(record.input, record.input_bytes, sizeof(record.input_bytes));
+
+    const auto path = metadata_dump_dir + "/files/metadata-crypto-probe70.bin";
+    int fd = open(path.c_str(), O_CREAT | O_APPEND | O_WRONLY | O_CLOEXEC, 0600);
+    if (fd != -1) {
+        (void)write(fd, &record, sizeof(record));
+        close(fd);
+    }
+    write_status(metadata_dump_dir.c_str(), "metadata crypto probe call=" +
+                                             std::to_string(call + 1) + "/16");
+}
+
+bool install_metadata_crypto_probe(const char *game_data_dir) {
+    if (metadata_crypto_probe_installed.load()) {
+        return true;
+    }
+    auto target = reinterpret_cast<void *>(genshin_module_base + 0x074B6404);
+    metadata_crypto_probe_calls.store(0);
+    unlink((metadata_dump_dir + "/files/metadata-crypto-probe70.bin").c_str());
+    void *trampoline = nullptr;
+    if (!install_inline_hook(target, reinterpret_cast<void *>(hooked_metadata_crypto),
+                             &trampoline)) {
+        write_status(game_data_dir, "metadata crypto probe hook install failed at RVA 0x74B6404");
+        return false;
+    }
+    original_metadata_crypto = reinterpret_cast<MetadataCrypto>(trampoline);
+    metadata_crypto_probe_installed.store(true);
+    write_status(game_data_dir, "metadata crypto probe hook installed at RVA 0x74B6404");
     return true;
 }
 
@@ -521,6 +669,7 @@ bool install_genshin70_metadata_hook(void *handle, const char *game_data_dir) {
     write_status(game_data_dir, "7.0 metadata loader resolved without patching: base=" +
                                     pointer_string(info.dli_fbase) + " target=" +
                                     pointer_string(target) + " RVA=0x74B8FAC");
+    install_metadata_crypto_probe(game_data_dir);
     return true;
 }
 
