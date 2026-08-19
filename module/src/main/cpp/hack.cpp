@@ -649,7 +649,7 @@ void dump_runtime_class_records(const char *game_data_dir,
                                 std::vector<RuntimeClassCandidate> candidates) {
     constexpr size_t class_snapshot_size = 0x400;
     constexpr size_t pointer_snapshot_size = 0x800;
-    constexpr size_t maximum_pointer_snapshots = 192;
+    constexpr size_t maximum_pointer_snapshots = 512;
 
     std::sort(candidates.begin(), candidates.end(),
               [](const auto &left, const auto &right) {
@@ -702,7 +702,8 @@ void dump_runtime_class_records(const char *game_data_dir,
         std::vector<PointerSnapshot> pointers;
         std::set<uintptr_t> captured_targets;
         const auto capture_pointer = [&](uint8_t depth, uintptr_t source_address,
-                                         uint32_t source_offset, uintptr_t target) {
+                                         uint32_t source_offset, uintptr_t target,
+                                         size_t maximum_size) {
             if (pointers.size() >= maximum_pointer_snapshots) {
                 return;
             }
@@ -712,7 +713,7 @@ void dump_runtime_class_records(const char *game_data_dir,
                 return;
             }
             const auto data_size = static_cast<size_t>(std::min<uintptr_t>(
-                    pointer_snapshot_size, target_region->end - target));
+                    maximum_size, target_region->end - target));
             PointerSnapshot snapshot{};
             snapshot.record = {0x50523747, source_offset, source_address, target,
                                static_cast<uint32_t>(data_size), depth,
@@ -733,7 +734,8 @@ void dump_runtime_class_records(const char *game_data_dir,
             uintptr_t target = 0;
             memcpy(&target, class_data.data() + offset, sizeof(target));
             capture_pointer(1, candidate.address + offset,
-                            static_cast<uint32_t>(offset), target);
+                            static_cast<uint32_t>(offset), target,
+                            pointer_snapshot_size);
         }
 
         struct NestedPointer {
@@ -763,7 +765,51 @@ void dump_runtime_class_records(const char *game_data_dir,
             if (pointers.size() >= maximum_pointer_snapshots) {
                 break;
             }
-            capture_pointer(2, nested.source_address, nested.source_offset, nested.target);
+            capture_pointer(2, nested.source_address, nested.source_offset, nested.target,
+                            pointer_snapshot_size);
+        }
+
+        const auto second_level_end = pointers.size();
+        std::vector<NestedPointer> leaf_pointers;
+        for (size_t pointer_index = first_level_count;
+             pointer_index < second_level_end; ++pointer_index) {
+            const auto &pointer = pointers[pointer_index];
+            for (size_t offset = 0; offset + sizeof(uintptr_t) <= pointer.data.size();
+                 offset += sizeof(uintptr_t)) {
+                uintptr_t target = 0;
+                memcpy(&target, pointer.data.data() + offset, sizeof(target));
+                const auto *target_region = find_runtime_region(regions, target);
+                if (!target_region) {
+                    continue;
+                }
+
+                bool capture = target_region->executable;
+                if (!capture && target_region->end - target >= 4) {
+                    std::array<uint8_t, 0x80> string_probe{};
+                    const auto probe_size = static_cast<size_t>(std::min<uintptr_t>(
+                            string_probe.size(), target_region->end - target));
+                    if (read_self_memory(target, string_probe.data(), probe_size)) {
+                        size_t length = 0;
+                        while (length < probe_size && string_probe[length] >= 0x20 &&
+                               string_probe[length] <= 0x7E) {
+                            ++length;
+                        }
+                        capture = length >= 2 && length < probe_size &&
+                                  string_probe[length] == 0;
+                    }
+                }
+                if (capture) {
+                    leaf_pointers.push_back(
+                            {pointer.record.target_address + offset,
+                             static_cast<uint32_t>(offset), target});
+                }
+            }
+        }
+        for (const auto &leaf : leaf_pointers) {
+            if (pointers.size() >= maximum_pointer_snapshots) {
+                break;
+            }
+            capture_pointer(3, leaf.source_address, leaf.source_offset, leaf.target, 0x100);
         }
 
         RuntimeClassDumpRecord record{};
