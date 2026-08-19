@@ -68,6 +68,8 @@ std::atomic<uint32_t> metadata_crypto_probe_calls{0};
 std::atomic<uint32_t> metadata_whole_probe_calls{0};
 
 constexpr uint32_t kMetadataCryptoProbeCapacity = 1024;
+constexpr size_t kMetadataCryptoContextSize = 0xE50;
+constexpr size_t kMetadataCryptoWorkspaceSize = 0xB00;
 struct MetadataCryptoProbeRecord {
     uint32_t magic;
     uint32_t call;
@@ -82,6 +84,21 @@ struct MetadataCryptoProbeRecord {
 };
 std::array<MetadataCryptoProbeRecord, kMetadataCryptoProbeCapacity>
         metadata_crypto_probe_records{};
+
+struct MetadataCryptoContextProbe {
+    uint32_t magic;
+    uint32_t version;
+    uint32_t captured_calls;
+    uint32_t context_size;
+    uint32_t workspace_size;
+    uint32_t reserved;
+    uintptr_t args[5];
+    uint8_t context_before[kMetadataCryptoContextSize];
+    uint8_t context_after[kMetadataCryptoContextSize];
+    uint8_t workspace_before[kMetadataCryptoWorkspaceSize];
+    uint8_t workspace_after[kMetadataCryptoWorkspaceSize];
+};
+MetadataCryptoContextProbe metadata_crypto_context_probe{};
 
 bool install_inline_hook(void *target, void *replacement, void **original);
 void dump_metadata_layout_probes(const char *game_data_dir, const void *metadata,
@@ -309,6 +326,22 @@ void hooked_metadata_crypto(void *context, void *state, void *key, void *output,
         return;
     }
 
+    if (call == 0) {
+        metadata_crypto_context_probe.magic = 0x58433747; // G7CX
+        metadata_crypto_context_probe.version = 1;
+        metadata_crypto_context_probe.context_size = kMetadataCryptoContextSize;
+        metadata_crypto_context_probe.workspace_size = kMetadataCryptoWorkspaceSize;
+        metadata_crypto_context_probe.args[0] = reinterpret_cast<uintptr_t>(context);
+        metadata_crypto_context_probe.args[1] = reinterpret_cast<uintptr_t>(state);
+        metadata_crypto_context_probe.args[2] = reinterpret_cast<uintptr_t>(key);
+        metadata_crypto_context_probe.args[3] = reinterpret_cast<uintptr_t>(output);
+        metadata_crypto_context_probe.args[4] = reinterpret_cast<uintptr_t>(input);
+        memcpy(metadata_crypto_context_probe.context_before, context,
+               sizeof(metadata_crypto_context_probe.context_before));
+        memcpy(metadata_crypto_context_probe.workspace_before, input,
+               sizeof(metadata_crypto_context_probe.workspace_before));
+    }
+
     auto &record = metadata_crypto_probe_records[call];
     record.magic = 0x50374347; // G7CP
     record.call = call;
@@ -327,6 +360,11 @@ void hooked_metadata_crypto(void *context, void *state, void *key, void *output,
     memcpy(record.after_x2, key, sizeof(record.after_x2));
     memcpy(record.after_x3, output, sizeof(record.after_x3));
     memcpy(record.after_x4, input, sizeof(record.after_x4));
+    memcpy(metadata_crypto_context_probe.context_after, context,
+           sizeof(metadata_crypto_context_probe.context_after));
+    memcpy(metadata_crypto_context_probe.workspace_after, input,
+           sizeof(metadata_crypto_context_probe.workspace_after));
+    metadata_crypto_context_probe.captured_calls = call + 1;
 }
 
 void dump_metadata_crypto_probe(const char *game_data_dir) {
@@ -345,6 +383,19 @@ void dump_metadata_crypto_probe(const char *game_data_dir) {
                                    std::to_string(records) + "/" +
                                    std::to_string(calls) + " calls record_size=" +
                                    std::to_string(sizeof(MetadataCryptoProbeRecord)));
+
+    const auto context_path = std::string(game_data_dir) +
+                              "/files/metadata-crypto-context70.bin";
+    if (write_blob_file(context_path, &metadata_crypto_context_probe,
+                        sizeof(metadata_crypto_context_probe))) {
+        write_status(game_data_dir, "metadata crypto context complete: calls=" +
+                                       std::to_string(
+                                               metadata_crypto_context_probe.captured_calls) +
+                                       " size=" +
+                                       std::to_string(sizeof(metadata_crypto_context_probe)));
+    } else {
+        write_status(game_data_dir, "metadata crypto context dump failed");
+    }
 }
 
 void *hooked_metadata_whole_transform(void *buffer, uint32_t length) {
@@ -477,68 +528,22 @@ bool install_metadata_crypto_probe(const char *game_data_dir) {
     original_metadata_crypto = reinterpret_cast<MetadataCrypto>(trampoline);
     metadata_crypto_probe_installed.store(true);
     write_status(game_data_dir, "metadata crypto probe hook installed at RVA 0x74B6404");
-    install_metadata_whole_probe(game_data_dir);
     return true;
 }
 
-void capture_metadata_runtime_state(const char *game_data_dir) {
+void capture_metadata_runtime_state(const char *game_data_dir, const char *phase) {
     if (!genshin_module_base || !original_metadata_loader) {
         write_status(game_data_dir, "runtime state capture skipped: module base unavailable");
         return;
     }
 
-    dump_runtime_blob(game_data_dir, "metadata-runtime-state70.bin",
-                      genshin_module_base + 0x15260000, 0x1000);
-    dump_runtime_blob(game_data_dir, "metadata-runtime-keys70.bin",
+    const auto state_name = std::string("metadata-runtime-state-") + phase + "70.bin";
+    const auto keys_name = std::string("metadata-runtime-keys-") + phase + "70.bin";
+    dump_runtime_blob(game_data_dir, state_name.c_str(),
+                      genshin_module_base + 0x15260000, 0x3000);
+    dump_runtime_blob(game_data_dir, keys_name.c_str(),
                       genshin_module_base + 0x14A4B000, 0x3000);
-
-    struct ScanRange {
-        uintptr_t begin;
-        uintptr_t end;
-    };
-    constexpr ScanRange ranges[] = {
-            {0x132301A0, 0x148C8000},
-            {0x148CB180, 0x15268EB0},
-    };
-    const auto target = reinterpret_cast<uintptr_t>(original_metadata_loader);
-    std::vector<uintptr_t> references;
-    constexpr size_t chunk_size = 1024 * 1024;
-    std::vector<uint8_t> scan_buffer(chunk_size);
-    for (const auto &range : ranges) {
-        for (auto cursor = range.begin; cursor < range.end;) {
-            auto remaining = static_cast<size_t>(range.end - cursor);
-            auto request = remaining < scan_buffer.size() ? remaining : scan_buffer.size();
-            if (read_self_memory(genshin_module_base + cursor, scan_buffer.data(), request)) {
-                for (size_t offset = 0; offset + sizeof(uintptr_t) <= request;
-                     offset += sizeof(uintptr_t)) {
-                    uintptr_t value = 0;
-                    memcpy(&value, scan_buffer.data() + offset, sizeof(value));
-                    if (value == target) {
-                        references.push_back(cursor + offset);
-                        if (references.size() == 64) {
-                            break;
-                        }
-                    }
-                }
-            }
-            if (references.size() == 64) {
-                break;
-            }
-            cursor += request;
-        }
-        if (references.size() == 64) {
-            break;
-        }
-    }
-
-    std::string message = "metadata loader pointer references=" +
-                          std::to_string(references.size());
-    for (auto rva : references) {
-        char value[32]{};
-        snprintf(value, sizeof(value), " 0x%" PRIXPTR, rva);
-        message += value;
-    }
-    write_status(game_data_dir, message);
+    write_status(game_data_dir, std::string("runtime state pair captured: ") + phase);
 }
 
 void probe_metadata_buffer_decoder(const char *game_data_dir, const void *metadata) {
@@ -705,6 +710,7 @@ bool invoke_metadata_loader_for_dump(const char *game_data_dir) {
     auto metadata_dir = std::string("/storage/emulated/0/Android/data/") + GamePackageName +
                         "/files/il2cpp/Metadata/";
     write_status(game_data_dir, "actively invoking 7.0 metadata loader: dir=" + metadata_dir);
+    capture_metadata_runtime_state(game_data_dir, "before");
     auto loader = reinterpret_cast<MetadataLoader>(original_metadata_loader);
     auto *metadata = loader(metadata_dir.c_str());
     if (!metadata) {
@@ -715,9 +721,7 @@ bool invoke_metadata_loader_for_dump(const char *game_data_dir) {
     write_status(game_data_dir, "active metadata loader returned: ptr=" +
                                     pointer_string(metadata));
     dump_metadata_crypto_probe(game_data_dir);
-    run_metadata_whole_transform_probe(game_data_dir, metadata, metadata_dir.c_str());
-    capture_metadata_runtime_state(game_data_dir);
-    probe_metadata_buffer_decoder(game_data_dir, metadata);
+    capture_metadata_runtime_state(game_data_dir, "after");
     if (!metadata_dump_started.exchange(true)) {
         return dump_decrypted_metadata(metadata, metadata_dir.c_str());
     }
