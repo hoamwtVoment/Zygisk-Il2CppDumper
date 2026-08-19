@@ -591,11 +591,13 @@ struct RuntimeClassDumpRecord {
 struct RuntimePointerDumpRecord {
     uint32_t magic;
     uint32_t source_offset;
+    uintptr_t source_address;
     uintptr_t target_address;
     uint32_t data_size;
+    uint8_t depth;
     uint8_t writable;
     uint8_t executable;
-    uint16_t reserved;
+    uint8_t reserved;
 };
 #pragma pack(pop)
 
@@ -647,7 +649,7 @@ void dump_runtime_class_records(const char *game_data_dir,
                                 std::vector<RuntimeClassCandidate> candidates) {
     constexpr size_t class_snapshot_size = 0x400;
     constexpr size_t pointer_snapshot_size = 0x800;
-    constexpr size_t maximum_pointer_snapshots = 96;
+    constexpr size_t maximum_pointer_snapshots = 192;
 
     std::sort(candidates.begin(), candidates.end(),
               [](const auto &left, const auto &right) {
@@ -699,29 +701,69 @@ void dump_runtime_class_records(const char *game_data_dir,
         };
         std::vector<PointerSnapshot> pointers;
         std::set<uintptr_t> captured_targets;
+        const auto capture_pointer = [&](uint8_t depth, uintptr_t source_address,
+                                         uint32_t source_offset, uintptr_t target) {
+            if (pointers.size() >= maximum_pointer_snapshots) {
+                return;
+            }
+            const auto *target_region = find_runtime_region(regions, target);
+            if (!target_region || target_region->end - target < 0x20 ||
+                !captured_targets.insert(target).second) {
+                return;
+            }
+            const auto data_size = static_cast<size_t>(std::min<uintptr_t>(
+                    pointer_snapshot_size, target_region->end - target));
+            PointerSnapshot snapshot{};
+            snapshot.record = {0x50523747, source_offset, source_address, target,
+                               static_cast<uint32_t>(data_size), depth,
+                               static_cast<uint8_t>(target_region->writable),
+                               static_cast<uint8_t>(target_region->executable), 0}; // G7RP
+            snapshot.data.resize(data_size);
+            if (!read_self_memory(target, snapshot.data.data(), snapshot.data.size())) {
+                captured_targets.erase(target);
+                return;
+            }
+            pointers.push_back(std::move(snapshot));
+        };
+
         for (size_t offset = 0;
              offset + sizeof(uintptr_t) <= class_data.size() &&
              pointers.size() < maximum_pointer_snapshots;
              offset += sizeof(uintptr_t)) {
             uintptr_t target = 0;
             memcpy(&target, class_data.data() + offset, sizeof(target));
-            const auto *target_region = find_runtime_region(regions, target);
-            if (!target_region || target_region->end - target < 0x20 ||
-                !captured_targets.insert(target).second) {
-                continue;
+            capture_pointer(1, candidate.address + offset,
+                            static_cast<uint32_t>(offset), target);
+        }
+
+        struct NestedPointer {
+            uintptr_t source_address;
+            uint32_t source_offset;
+            uintptr_t target;
+        };
+        std::vector<NestedPointer> nested_pointers;
+        const auto first_level_count = pointers.size();
+        for (size_t pointer_index = 0; pointer_index < first_level_count;
+             ++pointer_index) {
+            const auto &pointer = pointers[pointer_index];
+            for (size_t offset = 0; offset + sizeof(uintptr_t) <= pointer.data.size();
+                 offset += sizeof(uintptr_t)) {
+                uintptr_t target = 0;
+                memcpy(&target, pointer.data.data() + offset, sizeof(target));
+                const auto *target_region = find_runtime_region(regions, target);
+                if (!target_region || (!target_region->executable && (target & 7) != 0)) {
+                    continue;
+                }
+                nested_pointers.push_back(
+                        {pointer.record.target_address + offset,
+                         static_cast<uint32_t>(offset), target});
             }
-            const auto data_size = static_cast<size_t>(std::min<uintptr_t>(
-                    pointer_snapshot_size, target_region->end - target));
-            PointerSnapshot snapshot{};
-            snapshot.record = {0x50523747, static_cast<uint32_t>(offset), target,
-                               static_cast<uint32_t>(data_size),
-                               static_cast<uint8_t>(target_region->writable),
-                               static_cast<uint8_t>(target_region->executable), 0}; // G7RP
-            snapshot.data.resize(data_size);
-            if (!read_self_memory(target, snapshot.data.data(), snapshot.data.size())) {
-                continue;
+        }
+        for (const auto &nested : nested_pointers) {
+            if (pointers.size() >= maximum_pointer_snapshots) {
+                break;
             }
-            pointers.push_back(std::move(snapshot));
+            capture_pointer(2, nested.source_address, nested.source_offset, nested.target);
         }
 
         RuntimeClassDumpRecord record{};
@@ -746,8 +788,10 @@ void dump_runtime_class_records(const char *game_data_dir,
             binary.write(reinterpret_cast<const char *>(pointer.data.data()),
                          pointer.data.size());
             index << "  PTR source=+0x" << std::hex << pointer.record.source_offset
+                  << " source_address=0x" << pointer.record.source_address
                   << " target=0x" << pointer.record.target_address << std::dec
                   << " size=" << pointer.record.data_size
+                  << " depth=" << static_cast<int>(pointer.record.depth)
                   << " writable=" << static_cast<int>(pointer.record.writable)
                   << " executable=" << static_cast<int>(pointer.record.executable) << '\n';
         }
